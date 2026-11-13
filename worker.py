@@ -1,4 +1,4 @@
-"""BinanceWin V4.4.1 - public futures market research alerts; never places orders."""
+"""BinanceWin V4.5.1 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -14,7 +14,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/4.4.1'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/4.5.1'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -22,6 +22,13 @@ RETRIES = max(0, min(5, int(os.getenv('API_RETRIES', '2'))))
 OKX = 'https://www.okx.com'
 BINGX = 'https://open-api.bingx.com'
 SCAN_OFFSET = 35
+# Optional explicitly configured exchange-listed equity-linked swaps.
+# Exact symbols must be confirmed from live exchange instrument listings.
+EQUITY_SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('EQUITY_SYMBOLS', 'RKLB,TSLA,SNXX,SNDK,SPCX,MU,MUU,NVDA,NVDL').split(',') if x.strip()))
+WATCH_ALERTS = os.getenv('WATCH_ALERTS', '1') == '1'
+WATCH_MIN_VOLUME = float(os.getenv('WATCH_MIN_VOLUME', '1.2'))
+WATCH_MAX_PER_SCAN = max(0, min(10, int(os.getenv('WATCH_MAX_PER_SCAN', '3'))))
+
 
 class MarketError(Exception):
     pass
@@ -154,6 +161,41 @@ def kdj(df):
     return k, d, 3*k-2*d
 
 def signal(d15, d1h):
+    result = evaluate(d15, d1h)
+    return result if result and result['grade'] == '強訊號' else None
+
+def equity_universe(venue):
+    """Match requested tickers to exact live USDT swaps; never invent contracts.
+
+    Some tickers may represent ETFs, leveraged products or unrelated crypto tokens.
+    A symbol match alone does NOT prove a contract tracks a US equity.
+    """
+    if not EQUITY_SYMBOLS:
+        return [], list(EQUITY_SYMBOLS)
+    if venue == 'OKX':
+        instruments = okx_get('/api/v5/public/instruments', {'instType': 'SWAP'})
+        live = [x['instId'] for x in instruments
+                if x.get('state') == 'live' and x.get('settleCcy') == 'USDT'
+                and x.get('instId', '').endswith('-USDT-SWAP')]
+        template = lambda ticker: ticker + '-USDT-SWAP'
+    else:
+        contracts = bingx_get('/openApi/swap/v2/quote/contracts')
+        if isinstance(contracts, dict):
+            contracts = [contracts]
+        live = [x['symbol'] for x in contracts
+                if x.get('symbol', '').endswith('-USDT')
+                and str(x.get('status', '1')) in ('1', 'TRADING')]
+        template = lambda ticker: ticker + '-USDT'
+    live = set(live)
+    found = [(ticker, template(ticker)) for ticker in EQUITY_SYMBOLS if template(ticker) in live]
+    missing = [ticker for ticker in EQUITY_SYMBOLS if template(ticker) not in live]
+    for ticker in missing:
+        LOG.info('WATCHLIST NOT LISTED on %s: %s', venue, ticker)
+    for ticker, symbol in found:
+        LOG.info('WATCHLIST SYMBOL FOUND on %s: %s -> %s (underlying unverified)', venue, ticker, symbol)
+    return [symbol for _, symbol in found], missing
+
+def evaluate(d15, d1h):
     if len(d15) < 45 or len(d1h) < 40:
         return None
     row = d15.iloc[-1]
@@ -167,27 +209,63 @@ def signal(d15, d1h):
     rv = float(rsi(d15.close).iloc[-1])
     k, d, j = kdj(d15)
     kval, dval, jval = float(k.iloc[-1]), float(d.iloc[-1]), float(j.iloc[-1])
-    if not all(np.isfinite(v) for v in (hist, rv, kval, dval, jval)):
+    if not all(np.isfinite(v) for v in (hist, rv, kval, dval, jval, multiple)):
         return None
-    if multiple < float(os.getenv('MIN_VOLUME_MULTIPLE', '1.5')):
-        return None
-    long_ok = row.close > past.high.max() and hist > 0 and rv >= float(os.getenv('RSI_LONG', '52'))
-    short_ok = row.close < past.low.min() and hist < 0 and rv <= float(os.getenv('RSI_SHORT', '48'))
-    if os.getenv('REQUIRE_KDJ', 'true').lower() == 'true':
-        long_ok = long_ok and kval > dval
-        short_ok = short_ok and kval < dval
-    direction = '\u504f\u591a\u5019\u9078' if long_ok else '\u504f\u7a7a\u5019\u9078' if short_ok else None
-    if not direction:
-        return None
-    return {'direction': direction, 'price': float(row.close), 'volume': multiple,
-            'rsi': rv, 'k': kval, 'd': dval, 'j': jval, 'macd': hist,
-            'candle': datetime.fromtimestamp(int(row.close_ms)/1000, timezone.utc).isoformat()}
+    required_kdj = os.getenv('REQUIRE_KDJ', 'true').lower() == 'true'
+    choices = []
+    for direction, breakout, trend, rsi_ok, kdj_ok in [
+        ('偏多', bool(row.close > past.high.max()), hist > 0, rv >= float(os.getenv('RSI_LONG', '52')), kval > dval),
+        ('偏空', bool(row.close < past.low.min()), hist < 0, rv <= float(os.getenv('RSI_SHORT', '48')), kval < dval),
+    ]:
+        checks = {'突破': breakout, 'MACD': trend, 'RSI': rsi_ok, 'KDJ': kdj_ok if required_kdj else True, '成交量': multiple >= float(os.getenv('MIN_VOLUME_MULTIPLE', '1.5'))}
+        misses = [name for name, passed in checks.items() if not passed]
+        if not misses:
+            grade = '強訊號'
+        elif WATCH_ALERTS and len(misses) == 1 and multiple >= WATCH_MIN_VOLUME:
+            grade = '觀察訊號'
+        else:
+            continue
+        choices.append({'direction': direction, 'grade': grade, 'missing': misses, 'price': float(row.close), 'volume': multiple,
+                        'rsi': rv, 'k': kval, 'd': dval, 'j': jval, 'macd': hist,
+                        'candle': datetime.fromtimestamp(int(row.close_ms)/1000, timezone.utc).isoformat()})
+    return next((x for x in choices if x['grade'] == '強訊號'), choices[0] if choices else None)
+
+def save_observation(venue, symbol, result):
+    with sqlite3.connect(DB, timeout=30) as c:
+        cur = c.execute('INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?)',
+                        (venue, symbol, result['direction'], result['grade'], result['candle'], result['price'], datetime.now(timezone.utc).isoformat()))
+        return cur.rowcount > 0
+
+def track_performance(venue, symbol, d15):
+    """Retrospective close-to-close movement; not executable PnL or backtest win rate."""
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(DB, timeout=30) as c:
+        pending = c.execute('SELECT o.direction,o.grade,o.candle,o.price,p.hours FROM observations o CROSS JOIN (SELECT 1 hours UNION ALL SELECT 4 UNION ALL SELECT 24) p LEFT JOIN performance f ON f.venue=o.venue AND f.symbol=o.symbol AND f.direction=o.direction AND f.grade=o.grade AND f.candle=o.candle AND f.hours=p.hours WHERE o.venue=? AND o.symbol=? AND f.hours IS NULL AND o.recorded_utc>=?',
+                            (venue, symbol, datetime.fromtimestamp(time.time()-7*86400, timezone.utc).isoformat())).fetchall()
+        for direction, grade, candle, price, hours_ in pending:
+            target_ms = int(datetime.fromisoformat(candle).timestamp()*1000) + hours_*3600000
+            if target_ms > now_ms or price <= 0:
+                continue
+            later = d15[d15.close_ms >= target_ms]
+            if later.empty:
+                continue
+            observed = float(later.iloc[0].close)
+            signed_return = 100 * (observed/price-1) * (1 if direction == '偏多' else -1)
+            c.execute('INSERT OR IGNORE INTO performance VALUES (?,?,?,?,?,?,?,?)',
+                      (venue, symbol, direction, grade, candle, hours_, signed_return, datetime.now(timezone.utc).isoformat()))
+
+def performance_summary():
+    with sqlite3.connect(DB, timeout=30) as c:
+        rows = c.execute('SELECT hours,COUNT(*),AVG(return_pct),SUM(CASE WHEN return_pct>0 THEN 1 ELSE 0 END) FROM performance WHERE grade=? GROUP BY hours ORDER BY hours', ('強訊號',)).fetchall()
+    return '｜'.join(f'{h}h {n}筆/方向正確{wins/n:.0%}/均變動{avg:+.2f}%' for h,n,avg,wins in rows if n) or '尚無成熟樣本'
 
 def init_db():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB, timeout=30) as c:
         c.execute('CREATE TABLE IF NOT EXISTS alerts (venue TEXT, symbol TEXT, direction TEXT, candle TEXT, sent_utc TEXT, PRIMARY KEY(venue,symbol,direction,candle))')
         c.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        c.execute('CREATE TABLE IF NOT EXISTS observations (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, price REAL, recorded_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle))')
+        c.execute('CREATE TABLE IF NOT EXISTS performance (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, hours INTEGER, return_pct REAL, checked_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle,hours))')
 
 def get_state(key):
     with sqlite3.connect(DB, timeout=30) as c:
@@ -210,11 +288,11 @@ def telegram(message):
         raise RuntimeError(f'Telegram error: {result.get("description")}')
 
 def notify(venue, symbol, row):
-    key = (venue, symbol, row['direction'], row['candle'])
+    key = (venue, symbol, row['direction'] + '/' + row['grade'], row['candle'])
     with sqlite3.connect(DB, timeout=30) as c:
         if c.execute('SELECT 1 FROM alerts WHERE venue=? AND symbol=? AND direction=? AND candle=?', key).fetchone():
             return False
-        message = (f'\U0001f514 BinanceWin V4.4.1\uff5c{row["direction"]}\n'
+        message = (f'\U0001f514 BinanceWin V4.5.1\uff5c{row["direction"]}\n'
                    f'\u4ea4\u6613\u6240\uff1a{venue}\uff5c\u5408\u7d04\uff1a{symbol}\n'
                    f'15m \u6536\u76e4 UTC\uff1a{row["candle"]}\n'
                    f'\u6536\u76e4\u50f9\uff1a{row["price"]:.9g} USDT\n'
@@ -240,10 +318,21 @@ def scan_once():
             LOG.error('%s unavailable: %s', name, exc)
             errors.append(f'{name}: {str(exc)[:120]}')
     if not venue:
-        stats = {'venue': 'NONE', 'attempted': 0, 'successful': 0, 'candidates': 0, 'sent': 0, 'errors': len(errors), 'notes': errors}
+        stats = {'venue': 'NONE', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': len(errors), 'notes': errors}
         LOG.error('Scan complete: %s', json.dumps(stats, ensure_ascii=False))
         return stats
-    stats = {'venue': venue, 'attempted': 0, 'successful': 0, 'candidates': 0, 'sent': 0, 'errors': 0, 'notes': errors}
+    stats = {'venue': venue, 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': 0, 'notes': errors}
+    # Add an explicit equity-linked watchlist separately from crypto TOP_N.
+    try:
+        extra, missing = equity_universe(venue)
+        stats['equity'] = len(extra)
+        stats['equity_missing'] = missing
+        symbols = list(dict.fromkeys(symbols + extra))
+    except Exception as exc:
+        LOG.warning('Equity watchlist discovery failed: %s', exc)
+        stats['notes'].append('美股相關合約清單查詢失敗')
+        stats['equity_missing'] = EQUITY_SYMBOLS[:]
+    watch_sent = 0
     for symbol in symbols:
         stats['attempted'] += 1
         try:
@@ -252,11 +341,19 @@ def scan_once():
             if len(d15) < 45 or len(d1h) < 40:
                 raise MarketError('Insufficient candle history')
             stats['successful'] += 1
-            result = signal(d15, d1h)
+            track_performance(venue, symbol, d15)
+            result = evaluate(d15, d1h)
             if result:
-                stats['candidates'] += 1
-                if notify(venue, symbol, result):
-                    stats['sent'] += 1
+                if result['grade'] == '強訊號':
+                    stats['candidates'] += 1
+                else:
+                    stats['watch'] += 1
+                if save_observation(venue, symbol, result):
+                    if result['grade'] == '強訊號' or watch_sent < WATCH_MAX_PER_SCAN:
+                        if notify(venue, symbol, result):
+                            stats['sent'] += 1
+                            if result['grade'] == '觀察訊號':
+                                watch_sent += 1
         except Exception as exc:
             stats['errors'] += 1
             LOG.warning('%s %s failed: %s', venue, symbol, exc)
@@ -267,11 +364,12 @@ def status_message(stats, last_error=None):
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     rate = 100 * stats['successful'] / stats['attempted'] if stats['attempted'] else 0
     notes = '; '.join(stats.get('notes', []))[:250] or '\u7121'
-    return (f'\U0001f4e1 BinanceWin V4.4.1 \u6bcf\u5c0f\u6642\u72c0\u614b\n\u6642\u9593\uff1a{now}\n'
+    equity_line = f'\n指定合約匹配：{stats.get("equity", 0)}/{len(EQUITY_SYMBOLS)}；未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}'
+    return (f'\U0001f4e1 BinanceWin V4.5.1 \u6bcf\u5c0f\u6642\u72c0\u614b\n\u6642\u9593\uff1a{now}\n'
             f'\u884c\u60c5\u4f86\u6e90\uff1a{stats["venue"]}\n\u6383\u63cf\uff1a{stats["successful"]}/{stats["attempted"]}\uff5c\u6210\u529f\u7387\uff1a{rate:.0f}%\n'
             f'\u5019\u9078\u8a0a\u865f\uff1a{stats["candidates"]}\uff5c\u65b0\u901a\u77e5\uff1a{stats["sent"]}\n'
             f'\u55ae\u5e63\u932f\u8aa4\uff1a{stats["errors"]}\n\u4f86\u6e90\u5207\u63db\uff0f\u9023\u7dda\uff1a{notes}\n'
-            f'\u6700\u65b0\u7570\u5e38\uff1a{last_error or "\u7121"}\n\u50c5\u4f9b\u7814\u7a76\uff0c\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
+            f'{equity_line}\n\u6700\u65b0\u7570\u5e38\uff1a{last_error or "\u7121"}\n\u50c5\u4f9b\u7814\u7a76\uff0c\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -281,14 +379,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V4.4.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V4.5.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V4.4.1 started; OKX primary, BingX fallback, TOP_N=%s', TOP_N)
-    last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'sent': 0, 'errors': 0, 'notes': []}
+    LOG.info('BinanceWin V4.5.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
         now = time.time()
