@@ -1,4 +1,4 @@
-"""BinanceWin V4.4 - public futures market research alerts; never places orders."""
+"""BinanceWin V4.4.1 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -14,7 +14,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/4.4'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/4.4.1'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -176,7 +176,7 @@ def signal(d15, d1h):
     if os.getenv('REQUIRE_KDJ', 'true').lower() == 'true':
         long_ok = long_ok and kval > dval
         short_ok = short_ok and kval < dval
-    direction = 'åå¤åé¸' if long_ok else 'åç©ºåé¸' if short_ok else None
+    direction = '\u504f\u591a\u5019\u9078' if long_ok else '\u504f\u7a7a\u5019\u9078' if short_ok else None
     if not direction:
         return None
     return {'direction': direction, 'price': float(row.close), 'volume': multiple,
@@ -202,7 +202,8 @@ def telegram(message):
     token, chat = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
     if not token or not chat:
         raise RuntimeError('Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID')
-    r = HTTP.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat, 'text': message}, timeout=TIMEOUT)
+    payload = json.dumps({'chat_id': chat, 'text': message}, ensure_ascii=True).encode('ascii')
+    r = HTTP.post(f'https://api.telegram.org/bot{token}/sendMessage', data=payload, headers={'Content-Type': 'application/json; charset=utf-8'}, timeout=TIMEOUT)
     r.raise_for_status()
     result = r.json()
     if not result.get('ok'):
@@ -213,14 +214,14 @@ def notify(venue, symbol, row):
     with sqlite3.connect(DB, timeout=30) as c:
         if c.execute('SELECT 1 FROM alerts WHERE venue=? AND symbol=? AND direction=? AND candle=?', key).fetchone():
             return False
-        message = (f'ð BinanceWin V4.4ï½{row["direction"]}\n'
-                   f'äº¤ææï¼{venue}ï½åç´ï¼{symbol}\n'
-                   f'15m æ¶ç¤ UTCï¼{row["candle"]}\n'
-                   f'æ¶ç¤å¹ï¼{row["price"]:.9g} USDT\n'
-                   f'æ¾éï¼{row["volume"]:.2f}Ã\n'
-                   f'RSIï¼{row["rsi"]:.1f}ï½KDJï¼{row["k"]:.1f}/{row["d"]:.1f}/{row["j"]:.1f}\n'
-                   f'1h MACD æ±ï¼{row["macd"]:.7g}\n'
-                   'ç ç©¶è¨èï¼éäº¤æå»ºè­°ï¼ä¸èªåä¸å®ã')
+        message = (f'\U0001f514 BinanceWin V4.4.1\uff5c{row["direction"]}\n'
+                   f'\u4ea4\u6613\u6240\uff1a{venue}\uff5c\u5408\u7d04\uff1a{symbol}\n'
+                   f'15m \u6536\u76e4 UTC\uff1a{row["candle"]}\n'
+                   f'\u6536\u76e4\u50f9\uff1a{row["price"]:.9g} USDT\n'
+                   f'\u653e\u91cf\uff1a{row["volume"]:.2f}\u00d7\n'
+                   f'RSI\uff1a{row["rsi"]:.1f}\uff5cKDJ\uff1a{row["k"]:.1f}/{row["d"]:.1f}/{row["j"]:.1f}\n'
+                   f'1h MACD \u67f1\uff1a{row["macd"]:.7g}\n'
+                   '\u7814\u7a76\u8a0a\u865f\uff0c\u975e\u4ea4\u6613\u5efa\u8b70\uff1b\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
         telegram(message)
         c.execute('INSERT INTO alerts VALUES (?,?,?,?,?)', (*key, datetime.now(timezone.utc).isoformat()))
         return True
@@ -265,12 +266,12 @@ def scan_once():
 def status_message(stats, last_error=None):
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     rate = 100 * stats['successful'] / stats['attempted'] if stats['attempted'] else 0
-    notes = '; '.join(stats.get('notes', []))[:250] or 'ç¡'
-    return (f'ð¡ BinanceWin V4.4 æ¯å°æçæ\næéï¼{now}\n'
-            f'è¡æä¾æºï¼{stats["venue"]}\nææï¼{stats["successful"]}/{stats["attempted"]}ï½æåçï¼{rate:.0f}%\n'
-            f'åé¸è¨èï¼{stats["candidates"]}ï½æ°éç¥ï¼{stats["sent"]}\n'
-            f'å®å¹£é¯èª¤ï¼{stats["errors"]}\nä¾æºåæï¼é£ç·ï¼{notes}\n'
-            f'ææ°ç°å¸¸ï¼{last_error or "ç¡"}\nåä¾ç ç©¶ï¼ä¸èªåä¸å®ã')
+    notes = '; '.join(stats.get('notes', []))[:250] or '\u7121'
+    return (f'\U0001f4e1 BinanceWin V4.4.1 \u6bcf\u5c0f\u6642\u72c0\u614b\n\u6642\u9593\uff1a{now}\n'
+            f'\u884c\u60c5\u4f86\u6e90\uff1a{stats["venue"]}\n\u6383\u63cf\uff1a{stats["successful"]}/{stats["attempted"]}\uff5c\u6210\u529f\u7387\uff1a{rate:.0f}%\n'
+            f'\u5019\u9078\u8a0a\u865f\uff1a{stats["candidates"]}\uff5c\u65b0\u901a\u77e5\uff1a{stats["sent"]}\n'
+            f'\u55ae\u5e63\u932f\u8aa4\uff1a{stats["errors"]}\n\u4f86\u6e90\u5207\u63db\uff0f\u9023\u7dda\uff1a{notes}\n'
+            f'\u6700\u65b0\u7570\u5e38\uff1a{last_error or "\u7121"}\n\u50c5\u4f9b\u7814\u7a76\uff0c\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -280,13 +281,13 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('â BinanceWin V4.4 Telegram æ¸¬è©¦æåï¼ä¸ä»£è¡¨è¡ææææåã')
+        telegram('\u2705 BinanceWin V4.4.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V4.4 started; OKX primary, BingX fallback, TOP_N=%s', TOP_N)
+    LOG.info('BinanceWin V4.4.1 started; OKX primary, BingX fallback, TOP_N=%s', TOP_N)
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
@@ -298,7 +299,7 @@ def main():
             set_state('last_scan_slot', slot)
             try:
                 last_stats = scan_once()
-                last_error = None if last_stats['successful'] > 0 else 'æ¬è¼ªæ²ææååå¾è¡æ'
+                last_error = None if last_stats['successful'] > 0 else '\u672c\u8f2a\u6c92\u6709\u6210\u529f\u53d6\u5f97\u884c\u60c5'
                 set_state('last_stats', json.dumps(last_stats, ensure_ascii=False))
             except Exception as exc:
                 last_error = str(exc)[:200]
