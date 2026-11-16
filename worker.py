@@ -1,4 +1,4 @@
-"""BinanceWin V4.5.1 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.0 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -14,7 +14,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/4.5.1'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.0'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -28,6 +28,16 @@ EQUITY_SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('EQUITY
 WATCH_ALERTS = os.getenv('WATCH_ALERTS', '1') == '1'
 WATCH_MIN_VOLUME = float(os.getenv('WATCH_MIN_VOLUME', '1.2'))
 WATCH_MAX_PER_SCAN = max(0, min(10, int(os.getenv('WATCH_MAX_PER_SCAN', '3'))))
+FEE_BPS = float(os.getenv('ROUND_TRIP_FEE_BPS', '10'))
+SLIPPAGE_BPS = float(os.getenv('ROUND_TRIP_SLIPPAGE_BPS', '6'))
+ATR_SL = float(os.getenv('ATR_STOP_MULTIPLE', '1.5'))
+RISK_REWARD = float(os.getenv('TAKE_PROFIT_R', '2.0'))
+SCORE_STRONG = int(os.getenv('SCORE_STRONG', '85'))
+SCORE_CANDIDATE = int(os.getenv('SCORE_CANDIDATE', '70'))
+SCORE_WATCH = int(os.getenv('SCORE_WATCH', '55'))
+# Conservative: matching a ticker does NOT verify the tracked equity.
+EQUITY_ALLOW_UNVERIFIED = os.getenv('EQUITY_ALLOW_UNVERIFIED', '0') == '1'
+MAX_CANDLE_AGE_MIN = int(os.getenv('MAX_CANDLE_AGE_MIN', '50'))
 
 
 class MarketError(Exception):
@@ -117,10 +127,10 @@ def bingx_universe():
     return [s for _, s in ranked[:TOP_N]]
 
 def candles(venue, symbol, interval, limit=220):
-    duration = 900000 if interval == '15m' else 3600000
+    duration = {'5m':300000, '15m':900000, '1h':3600000, '4h':14400000}[interval]
     rows = []
     if venue == 'OKX':
-        data = okx_get('/api/v5/market/history-candles', {'instId': symbol, 'bar': '15m' if interval == '15m' else '1H', 'limit': min(limit, 300)})
+        data = okx_get('/api/v5/market/history-candles', {'instId': symbol, 'bar': {'5m':'5m','15m':'15m','1h':'1H','4h':'4H'}[interval], 'limit': min(limit, 300)})
         for x in data:
             if len(x) < 9 or str(x[8]) != '1':
                 continue
@@ -195,40 +205,66 @@ def equity_universe(venue):
         LOG.info('WATCHLIST SYMBOL FOUND on %s: %s -> %s (underlying unverified)', venue, ticker, symbol)
     return [symbol for _, symbol in found], missing
 
-def evaluate(d15, d1h):
-    if len(d15) < 45 or len(d1h) < 40:
+def atr(df, period=14):
+    prev = df.close.shift(1)
+    true_range = pd.concat([(df.high-df.low).abs(), (df.high-prev).abs(), (df.low-prev).abs()], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+
+def evaluate(d15, d1h, d4h=None, d5m=None, historical=False):
+    """Closed-candle-only research score. No score is a probability of profit."""
+    if d4h is None or d5m is None or min(len(d15),len(d1h),len(d4h),len(d5m)) < 40:
         return None
     row = d15.iloc[-1]
+    now_ms = int(time.time()*1000)
+    if not historical and now_ms - int(row.close_ms) > MAX_CANDLE_AGE_MIN*60000:
+        raise MarketError('Stale 15m candle')
     past = d15.iloc[-21:-1]
-    baseline = past.quote_volume.median()
-    multiple = float(row.quote_volume / baseline) if baseline > 0 else 0
     h = d1h[d1h.close_ms <= row.close_ms]
-    if len(h) < 40:
+    four = d4h[d4h.close_ms <= row.close_ms]
+    five = d5m[d5m.close_ms <= row.close_ms]
+    if min(len(h),len(four),len(five)) < 35:
         return None
-    hist = float(macd_hist(h.close).iloc[-1])
-    rv = float(rsi(d15.close).iloc[-1])
-    k, d, j = kdj(d15)
-    kval, dval, jval = float(k.iloc[-1]), float(d.iloc[-1]), float(j.iloc[-1])
-    if not all(np.isfinite(v) for v in (hist, rv, kval, dval, jval, multiple)):
+    base = float(past.quote_volume.median())
+    volume = float(row.quote_volume/base) if base > 0 else 0
+    rv = float(rsi(d15.close).iloc[-1]); k,d,j=kdj(d15)
+    kval,dval,jval=map(float,(k.iloc[-1],d.iloc[-1],j.iloc[-1]))
+    macd1 = float(macd_hist(h.close).iloc[-1])
+    macd4 = float(macd_hist(four.close).iloc[-1])
+    ma4 = float(four.close.ewm(span=20,adjust=False).mean().iloc[-1])
+    ma5 = float(five.close.ewm(span=12,adjust=False).mean().iloc[-1])
+    volatility = float(atr(d15).iloc[-1])
+    if not all(np.isfinite(x) for x in (volume,rv,kval,dval,jval,macd1,macd4,ma4,ma5,volatility)) or volatility<=0:
         return None
-    required_kdj = os.getenv('REQUIRE_KDJ', 'true').lower() == 'true'
-    choices = []
-    for direction, breakout, trend, rsi_ok, kdj_ok in [
-        ('偏多', bool(row.close > past.high.max()), hist > 0, rv >= float(os.getenv('RSI_LONG', '52')), kval > dval),
-        ('偏空', bool(row.close < past.low.min()), hist < 0, rv <= float(os.getenv('RSI_SHORT', '48')), kval < dval),
-    ]:
-        checks = {'突破': breakout, 'MACD': trend, 'RSI': rsi_ok, 'KDJ': kdj_ok if required_kdj else True, '成交量': multiple >= float(os.getenv('MIN_VOLUME_MULTIPLE', '1.5'))}
-        misses = [name for name, passed in checks.items() if not passed]
-        if not misses:
-            grade = '強訊號'
-        elif WATCH_ALERTS and len(misses) == 1 and multiple >= WATCH_MIN_VOLUME:
-            grade = '觀察訊號'
+    results=[]
+    for direction, sign in [('偏多',1),('偏空',-1)]:
+        breakout = row.close > past.high.max() if sign==1 else row.close < past.low.min()
+        near = row.close >= past.high.max()-0.5*volatility if sign==1 else row.close <= past.low.min()+0.5*volatility
+        trend4 = sign*(float(four.close.iloc[-1])-ma4)>0 and sign*macd4>0
+        trend1 = sign*macd1>0
+        trend5 = sign*(float(five.close.iloc[-1])-ma5)>0
+        momentum = sign*(kval-dval)>0
+        rsi_ok = rv>=52 if sign==1 else rv<=48
+        volume_ok = volume>=1.5
+        # 25 trend + 25 breakout/volume + 20 MACD + 15 RSI + 10 KDJ + 5 liquidity proxy
+        score = (15*trend4 + 10*trend5 + 15*breakout + 10*volume_ok + 20*trend1 + 15*rsi_ok + 10*momentum + 5*(base>0))
+        # Require directionally aligned 4h + 1h for trade-grade signals.
+        if score>=SCORE_STRONG and breakout and trend4 and trend1 and volume_ok:
+            grade='強訊號'
+        elif score>=SCORE_CANDIDATE and trend4 and trend1 and near:
+            grade='候選訊號'
+        elif score>=SCORE_WATCH and near:
+            grade='觀察訊號'
         else:
             continue
-        choices.append({'direction': direction, 'grade': grade, 'missing': misses, 'price': float(row.close), 'volume': multiple,
-                        'rsi': rv, 'k': kval, 'd': dval, 'j': jval, 'macd': hist,
-                        'candle': datetime.fromtimestamp(int(row.close_ms)/1000, timezone.utc).isoformat()})
-    return next((x for x in choices if x['grade'] == '強訊號'), choices[0] if choices else None)
+        stop_distance=ATR_SL*volatility
+        entry=float(row.close); stop=entry-sign*stop_distance
+        if stop<=0: continue
+        target=entry+sign*stop_distance*RISK_REWARD
+        missing=[name for name,passed in [('4H趨勢',trend4),('1H動能',trend1),('5M確認',trend5),('突破',breakout),('放量',volume_ok),('RSI',rsi_ok),('KDJ',momentum)] if not passed]
+        results.append({'direction':direction,'grade':grade,'score':int(score),'missing':missing,'price':entry,
+                        'stop':stop,'target':target,'atr':volatility,'volume':volume,'rsi':rv,'k':kval,'d':dval,
+                        'j':jval,'macd':macd1,'candle':datetime.fromtimestamp(int(row.close_ms)/1000,timezone.utc).isoformat()})
+    return max(results,key=lambda r:r['score']) if results else None
 
 def save_observation(venue, symbol, result):
     with sqlite3.connect(DB, timeout=30) as c:
@@ -266,6 +302,7 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS observations (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, price REAL, recorded_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle))')
         c.execute('CREATE TABLE IF NOT EXISTS performance (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, hours INTEGER, return_pct REAL, checked_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle,hours))')
+        c.execute('CREATE TABLE IF NOT EXISTS v5_signals (venue TEXT,symbol TEXT,direction TEXT,grade TEXT,candle TEXT,entry REAL,stop REAL,target REAL,score INTEGER,created_utc TEXT,outcome TEXT,net_pct REAL,settled_utc TEXT,PRIMARY KEY(venue,symbol,direction,grade,candle))')
 
 def get_state(key):
     with sqlite3.connect(DB, timeout=30) as c:
@@ -287,89 +324,121 @@ def telegram(message):
     if not result.get('ok'):
         raise RuntimeError(f'Telegram error: {result.get("description")}')
 
-def notify(venue, symbol, row):
-    key = (venue, symbol, row['direction'] + '/' + row['grade'], row['candle'])
-    with sqlite3.connect(DB, timeout=30) as c:
-        if c.execute('SELECT 1 FROM alerts WHERE venue=? AND symbol=? AND direction=? AND candle=?', key).fetchone():
-            return False
-        message = (f'\U0001f514 BinanceWin V4.5.1\uff5c{row["direction"]}\n'
-                   f'\u4ea4\u6613\u6240\uff1a{venue}\uff5c\u5408\u7d04\uff1a{symbol}\n'
-                   f'15m \u6536\u76e4 UTC\uff1a{row["candle"]}\n'
-                   f'\u6536\u76e4\u50f9\uff1a{row["price"]:.9g} USDT\n'
-                   f'\u653e\u91cf\uff1a{row["volume"]:.2f}\u00d7\n'
-                   f'RSI\uff1a{row["rsi"]:.1f}\uff5cKDJ\uff1a{row["k"]:.1f}/{row["d"]:.1f}/{row["j"]:.1f}\n'
-                   f'1h MACD \u67f1\uff1a{row["macd"]:.7g}\n'
-                   '\u7814\u7a76\u8a0a\u865f\uff0c\u975e\u4ea4\u6613\u5efa\u8b70\uff1b\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
+def notify(venue,symbol,row):
+    key=(venue,symbol,row['direction']+'/'+row['grade'],row['candle'])
+    with sqlite3.connect(DB,timeout=30) as c:
+        if c.execute('SELECT 1 FROM alerts WHERE venue=? AND symbol=? AND direction=? AND candle=?',key).fetchone():return False
+        message=(f'🔔 BinanceWin V5.0｜{row["grade"]}｜{row["direction"]}｜評分 {row["score"]}/100\n'
+                 f'交易所：{venue}｜合約：{symbol}\n15m 收盤 UTC：{row["candle"]}\n'
+                 f'參考進場：{row["price"]:.9g}｜ATR：{row["atr"]:.9g}\n'
+                 f'參考停損：{row["stop"]:.9g}｜參考停利：{row["target"]:.9g}（{RISK_REWARD:g}R）\n'
+                 f'成交量：{row["volume"]:.2f}×｜RSI：{row["rsi"]:.1f}｜KDJ：{row["k"]:.1f}/{row["d"]:.1f}\n'
+                 f'未確認：{", ".join(row["missing"]) or "無"}\n'
+                 '參考價非保證成交價；不自動下單。')
         telegram(message)
-        c.execute('INSERT INTO alerts VALUES (?,?,?,?,?)', (*key, datetime.now(timezone.utc).isoformat()))
+        c.execute('INSERT INTO alerts VALUES (?,?,?,?,?)',(*key,datetime.now(timezone.utc).isoformat()))
         return True
 
+def record_v5_signal(venue,symbol,result):
+    with sqlite3.connect(DB,timeout=30) as c:
+        c.execute('INSERT OR IGNORE INTO v5_signals (venue,symbol,direction,grade,candle,entry,stop,target,score,created_utc) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                  (venue,symbol,result['direction'],result['grade'],result['candle'],result['price'],result['stop'],result['target'],result['score'],datetime.now(timezone.utc).isoformat()))
+
+def settle_v5(venue,symbol,d15):
+    """Conservative same-bar TP/SL tie: SL first. Only bars after signal close."""
+    with sqlite3.connect(DB,timeout=30) as c:
+        pending=c.execute('SELECT direction,grade,candle,entry,stop,target FROM v5_signals WHERE venue=? AND symbol=? AND outcome IS NULL AND created_utc>=?',
+                          (venue,symbol,datetime.fromtimestamp(time.time()-8*86400,timezone.utc).isoformat())).fetchall()
+        for direction,grade,candle,entry,stop,target in pending:
+            start_ms=int(datetime.fromisoformat(candle).timestamp()*1000)
+            future=d15[d15.close_ms>start_ms]
+            if future.empty: continue
+            outcome=None; exit_price=None
+            for bar in future.itertuples():
+                hit_sl=bar.low<=stop if direction=='偏多' else bar.high>=stop
+                hit_tp=bar.high>=target if direction=='偏多' else bar.low<=target
+                if hit_sl: outcome='SL';exit_price=stop;break
+                if hit_tp: outcome='TP';exit_price=target;break
+            if outcome is None and int(future.iloc[-1].close_ms)-start_ms>=24*3600000:
+                outcome='24H';exit_price=float(future.iloc[-1].close)
+            if outcome:
+                sign=1 if direction=='偏多' else -1
+                pnl=100*sign*(exit_price/entry-1)-(FEE_BPS+SLIPPAGE_BPS)/100
+                c.execute('UPDATE v5_signals SET outcome=?,net_pct=?,settled_utc=? WHERE venue=? AND symbol=? AND direction=? AND grade=? AND candle=?',
+                          (outcome,pnl,datetime.now(timezone.utc).isoformat(),venue,symbol,direction,grade,candle))
+
+def v5_summary():
+    with sqlite3.connect(DB,timeout=30) as c:
+        rows=c.execute("SELECT outcome,net_pct FROM v5_signals WHERE outcome IS NOT NULL AND grade='強訊號'").fetchall()
+    if not rows:return '尚無已結算強訊號（非實際交易）'
+    n=len(rows); wins=sum(p>0 for _,p in rows); avg=sum(p for _,p in rows)/n
+    tp=sum(o=='TP' for o,_ in rows);sl=sum(o=='SL' for o,_ in rows)
+    return f'{n}筆｜淨報酬為正 {wins/n:.0%}｜平均 {avg:+.2f}%｜TP {tp}／SL {sl}（模擬）'
+
 def scan_once():
-    errors = []
-    venue, symbols = None, None
-    for name, probe in [('OKX', okx_universe), ('BingX', bingx_universe)]:
+    errors=[];venue=None;symbols=[]
+    for name,probe in [('OKX',okx_universe),('BingX',bingx_universe)]:
         try:
-            symbols = probe()
-            if len(candles(name, symbols[0], '15m', 60)) < 40:
-                raise MarketError('Candle probe returned insufficient history')
-            venue = name
-            break
+            symbols=probe()
+            if len(candles(name,symbols[0],'15m',60))<40:raise MarketError('Insufficient probe candles')
+            venue=name;break
         except Exception as exc:
-            LOG.error('%s unavailable: %s', name, exc)
-            errors.append(f'{name}: {str(exc)[:120]}')
-    if not venue:
-        stats = {'venue': 'NONE', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': len(errors), 'notes': errors}
-        LOG.error('Scan complete: %s', json.dumps(stats, ensure_ascii=False))
-        return stats
-    stats = {'venue': venue, 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': 0, 'notes': errors}
-    # Add an explicit equity-linked watchlist separately from crypto TOP_N.
+            errors.append(f'{name}: {str(exc)[:100]}');LOG.warning('%s unavailable: %s',name,exc)
+    stats={'venue':venue or 'NONE','attempted':0,'successful':0,'crypto_listed':len(symbols),'equity_matched':0,
+           'equity_missing':EQUITY_SYMBOLS[:],'equity_verified':0,'equity_unverified':[],
+           'candidates':0,'watch':0,'sent':0,'errors':0,'notes':errors}
+    if not venue:return stats
     try:
-        extra, missing = equity_universe(venue)
-        stats['equity'] = len(extra)
-        stats['equity_missing'] = missing
-        symbols = list(dict.fromkeys(symbols + extra))
+        extras,missing=equity_universe(venue)
+        stats['equity_matched']=len(extras);stats['equity_missing']=missing
+        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing]
+        # The exchange instrument name alone is insufficient proof of equity underlying.
+        symbols=list(dict.fromkeys(symbols+extras))
     except Exception as exc:
-        LOG.warning('Equity watchlist discovery failed: %s', exc)
-        stats['notes'].append('美股相關合約清單查詢失敗')
-        stats['equity_missing'] = EQUITY_SYMBOLS[:]
-    watch_sent = 0
+        stats['notes'].append(f'監控名單查詢失敗: {str(exc)[:80]}')
+    watch_sent=0
     for symbol in symbols:
-        stats['attempted'] += 1
+        stats['attempted']+=1
         try:
-            d15 = candles(venue, symbol, '15m', 220)
-            d1h = candles(venue, symbol, '1h', 110)
-            if len(d15) < 45 or len(d1h) < 40:
-                raise MarketError('Insufficient candle history')
-            stats['successful'] += 1
-            track_performance(venue, symbol, d15)
-            result = evaluate(d15, d1h)
-            if result:
-                if result['grade'] == '強訊號':
-                    stats['candidates'] += 1
-                else:
-                    stats['watch'] += 1
-                if save_observation(venue, symbol, result):
-                    if result['grade'] == '強訊號' or watch_sent < WATCH_MAX_PER_SCAN:
-                        if notify(venue, symbol, result):
-                            stats['sent'] += 1
-                            if result['grade'] == '觀察訊號':
-                                watch_sent += 1
+            d15=candles(venue,symbol,'15m',220)
+            d1=candles(venue,symbol,'1h',110)
+            d4=candles(venue,symbol,'4h',110)
+            d5=candles(venue,symbol,'5m',110)
+            if min(len(d15),len(d1),len(d4),len(d5))<40:raise MarketError('Insufficient history')
+            stats['successful']+=1
+            settle_v5(venue,symbol,d15)
+            # Continue legacy tracking for existing V4.5.1 observations.
+            track_performance(venue,symbol,d15)
+            result=evaluate(d15,d1,d4,d5)
+            if not result:continue
+            is_equity_name=symbol.split('-')[0] in EQUITY_SYMBOLS
+            if is_equity_name and not EQUITY_ALLOW_UNVERIFIED:
+                LOG.info('EQUITY UNVERIFIED suppressed alert: %s %s score=%s',symbol,result['direction'],result['score'])
+                continue
+            if result['grade']=='強訊號':stats['candidates']+=1
+            else:stats['watch']+=1
+            record_v5_signal(venue,symbol,result)
+            if result['grade']=='強訊號' or (WATCH_ALERTS and watch_sent<WATCH_MAX_PER_SCAN):
+                if notify(venue,symbol,result):
+                    stats['sent']+=1
+                    if result['grade']!='強訊號':watch_sent+=1
         except Exception as exc:
-            stats['errors'] += 1
-            LOG.warning('%s %s failed: %s', venue, symbol, exc)
-    LOG.info('Scan complete: %s', json.dumps(stats, ensure_ascii=False))
+            stats['errors']+=1
+            LOG.warning('%s %s failed: %s',venue,symbol,exc)
+    LOG.info('Scan complete: %s',json.dumps(stats,ensure_ascii=False))
     return stats
 
-def status_message(stats, last_error=None):
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    rate = 100 * stats['successful'] / stats['attempted'] if stats['attempted'] else 0
-    notes = '; '.join(stats.get('notes', []))[:250] or '\u7121'
-    equity_line = f'\n指定合約匹配：{stats.get("equity", 0)}/{len(EQUITY_SYMBOLS)}；未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}'
-    return (f'\U0001f4e1 BinanceWin V4.5.1 \u6bcf\u5c0f\u6642\u72c0\u614b\n\u6642\u9593\uff1a{now}\n'
-            f'\u884c\u60c5\u4f86\u6e90\uff1a{stats["venue"]}\n\u6383\u63cf\uff1a{stats["successful"]}/{stats["attempted"]}\uff5c\u6210\u529f\u7387\uff1a{rate:.0f}%\n'
-            f'\u5019\u9078\u8a0a\u865f\uff1a{stats["candidates"]}\uff5c\u65b0\u901a\u77e5\uff1a{stats["sent"]}\n'
-            f'\u55ae\u5e63\u932f\u8aa4\uff1a{stats["errors"]}\n\u4f86\u6e90\u5207\u63db\uff0f\u9023\u7dda\uff1a{notes}\n'
-            f'{equity_line}\n\u6700\u65b0\u7570\u5e38\uff1a{last_error or "\u7121"}\n\u50c5\u4f9b\u7814\u7a76\uff0c\u4e0d\u81ea\u52d5\u4e0b\u55ae\u3002')
+def status_message(stats,last_error=None):
+    now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
+    return (f'📡 BinanceWin V5.0 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+            f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
+            f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
+            f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
+            f'美股底層未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
+            f'強訊號：{stats["candidates"]}｜候選/觀察：{stats["watch"]}｜已發通知：{stats["sent"]}\n'
+            f'單幣錯誤：{stats["errors"]}｜異常：{last_error or "; ".join(stats["notes"]) or "無"}\n'
+            f'歷史模擬：{v5_summary()}\n僅供研究，不自動下單。')
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -379,14 +448,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V4.5.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.0 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V4.5.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
-    last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'equity': 0, 'equity_missing': [], 'sent': 0, 'errors': 0, 'notes': []}
+    LOG.info('BinanceWin V5.0 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
         now = time.time()
