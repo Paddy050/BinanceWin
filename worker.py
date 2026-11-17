@@ -1,4 +1,4 @@
-"""BinanceWin V5.0 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.1 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -6,7 +6,9 @@ import random
 import sqlite3
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import shutil
 
 import requests
 import numpy as np
@@ -14,7 +16,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.0'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.1'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -36,8 +38,20 @@ SCORE_STRONG = int(os.getenv('SCORE_STRONG', '85'))
 SCORE_CANDIDATE = int(os.getenv('SCORE_CANDIDATE', '70'))
 SCORE_WATCH = int(os.getenv('SCORE_WATCH', '55'))
 # Conservative: matching a ticker does NOT verify the tracked equity.
-EQUITY_ALLOW_UNVERIFIED = os.getenv('EQUITY_ALLOW_UNVERIFIED', '0') == '1'
+# Unverified equity-like ticker contracts are always suppressed unless explicitly allowlisted.
 MAX_CANDLE_AGE_MIN = int(os.getenv('MAX_CANDLE_AGE_MIN', '50'))
+TZ = ZoneInfo('Asia/Taipei')
+ALERT_COOLDOWN_MIN = max(0, int(os.getenv('ALERT_COOLDOWN_MIN', '120')))
+SCORE_CHANGE_ALERT = max(1, int(os.getenv('SCORE_CHANGE_ALERT', '15')))
+DAILY_REPORT_HOUR = max(0, min(23, int(os.getenv('DAILY_REPORT_HOUR_TW', '21'))))
+BACKUP_DIR = Path(os.getenv('BACKUP_DIR', str(DB.parent / 'backups')))
+BACKUP_KEEP_DAYS = max(1, int(os.getenv('BACKUP_KEEP_DAYS', '14')))
+MAX_STOP_PCT = float(os.getenv('MAX_STOP_PCT', '5'))
+MAX_RISK_PER_TRADE_PCT = float(os.getenv('MAX_RISK_PER_TRADE_PCT', '1'))
+MAX_NOTIONAL_PCT = float(os.getenv('MAX_NOTIONAL_PCT', '100'))
+SIM_CAPITAL_USDT = float(os.getenv('SIM_CAPITAL_USDT', '150'))
+# Explicit allowlist of independently confirmed instrument IDs; symbol matching alone is NOT verification.
+VERIFIED_EQUITY_CONTRACTS = set(x.strip().upper() for x in os.getenv('VERIFIED_EQUITY_CONTRACTS', '').split(',') if x.strip())
 
 
 class MarketError(Exception):
@@ -258,7 +272,7 @@ def evaluate(d15, d1h, d4h=None, d5m=None, historical=False):
             continue
         stop_distance=ATR_SL*volatility
         entry=float(row.close); stop=entry-sign*stop_distance
-        if stop<=0: continue
+        if stop<=0 or 100*stop_distance/entry>MAX_STOP_PCT: continue
         target=entry+sign*stop_distance*RISK_REWARD
         missing=[name for name,passed in [('4H趨勢',trend4),('1H動能',trend1),('5M確認',trend5),('突破',breakout),('放量',volume_ok),('RSI',rsi_ok),('KDJ',momentum)] if not passed]
         results.append({'direction':direction,'grade':grade,'score':int(score),'missing':missing,'price':entry,
@@ -302,6 +316,7 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         c.execute('CREATE TABLE IF NOT EXISTS observations (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, price REAL, recorded_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle))')
         c.execute('CREATE TABLE IF NOT EXISTS performance (venue TEXT, symbol TEXT, direction TEXT, grade TEXT, candle TEXT, hours INTEGER, return_pct REAL, checked_utc TEXT, PRIMARY KEY(venue,symbol,direction,grade,candle,hours))')
+        c.execute('CREATE TABLE IF NOT EXISTS alert_state (venue TEXT,symbol TEXT,direction TEXT,grade TEXT,score INTEGER,active INTEGER,last_sent_utc TEXT,updated_utc TEXT,PRIMARY KEY(venue,symbol,direction))')
         c.execute('CREATE TABLE IF NOT EXISTS v5_signals (venue TEXT,symbol TEXT,direction TEXT,grade TEXT,candle TEXT,entry REAL,stop REAL,target REAL,score INTEGER,created_utc TEXT,outcome TEXT,net_pct REAL,settled_utc TEXT,PRIMARY KEY(venue,symbol,direction,grade,candle))')
 
 def get_state(key):
@@ -324,20 +339,61 @@ def telegram(message):
     if not result.get('ok'):
         raise RuntimeError(f'Telegram error: {result.get("description")}')
 
+def tw_time(iso):
+    return datetime.fromisoformat(iso).astimezone(TZ).strftime('%Y/%m/%d %H:%M')
+
+def fmt_price(v):
+    return f'{v:,.2f}' if abs(v)>=10 else f'{v:,.5f}'.rstrip('0').rstrip('.')
+
 def notify(venue,symbol,row):
-    key=(venue,symbol,row['direction']+'/'+row['grade'],row['candle'])
+    """Only first appearance, material score rise, upgrade, direction change or expired cooldown.
+    Update state only after Telegram confirms success; scans continue every 15 minutes.
+    """
+    now=datetime.now(timezone.utc)
     with sqlite3.connect(DB,timeout=30) as c:
-        if c.execute('SELECT 1 FROM alerts WHERE venue=? AND symbol=? AND direction=? AND candle=?',key).fetchone():return False
-        message=(f'🔔 BinanceWin V5.0｜{row["grade"]}｜{row["direction"]}｜評分 {row["score"]}/100\n'
-                 f'交易所：{venue}｜合約：{symbol}\n15m 收盤 UTC：{row["candle"]}\n'
-                 f'參考進場：{row["price"]:.9g}｜ATR：{row["atr"]:.9g}\n'
-                 f'參考停損：{row["stop"]:.9g}｜參考停利：{row["target"]:.9g}（{RISK_REWARD:g}R）\n'
+        prev=c.execute('SELECT grade,score,active,last_sent_utc FROM alert_state WHERE venue=? AND symbol=? AND direction=?',
+                       (venue,symbol,row['direction'])).fetchone()
+        reason='首次發現'
+        if prev and prev[2]:
+            old_grade,old_score,_,last_sent=prev
+            elapsed=(now-datetime.fromisoformat(last_sent)).total_seconds()/60 if last_sent else 1e9
+            if row['grade']=='強訊號' and old_grade!='強訊號': reason='升級強訊號'
+            elif row['score']-old_score>=SCORE_CHANGE_ALERT: reason=f'評分增強 {old_score}→{row["score"]}'
+            elif elapsed>=ALERT_COOLDOWN_MIN and row['grade']=='強訊號': reason='強訊號持續'
+            else:
+                # Persist latest grade/score, not a new alert; retain last sent timestamp.
+                c.execute('UPDATE alert_state SET grade=?,score=?,updated_utc=? WHERE venue=? AND symbol=? AND direction=?',
+                          (row['grade'],row['score'],now.isoformat(),venue,symbol,row['direction']))
+                return False
+        risk_distance=abs(row['price']-row['stop'])
+        risk_usdt=max(0,SIM_CAPITAL_USDT*MAX_RISK_PER_TRADE_PCT/100)
+        notional=min(risk_usdt/(risk_distance/row['price']), SIM_CAPITAL_USDT*MAX_NOTIONAL_PCT/100) if risk_distance else 0
+        message=(f'🔔 BinanceWin V5.1｜{reason}｜{row["grade"]}｜{row["direction"]} {row["score"]}/100\n'
+                 f'交易所：{venue}｜合約：{symbol}\n台灣時間：{tw_time(row["candle"])}（15M 已收盤）\n'
+                 f'參考進場：{fmt_price(row["price"])}｜ATR：{fmt_price(row["atr"])}\n'
+                 f'參考停損：{fmt_price(row["stop"])}｜TP1：{fmt_price(row["price"]+(row["target"]-row["price"])*.75)}（1.5R）'
+                 f'｜TP2：{fmt_price(row["target"])}（{RISK_REWARD:g}R）\n'
                  f'成交量：{row["volume"]:.2f}×｜RSI：{row["rsi"]:.1f}｜KDJ：{row["k"]:.1f}/{row["d"]:.1f}\n'
-                 f'未確認：{", ".join(row["missing"]) or "無"}\n'
-                 '參考價非保證成交價；不自動下單。')
+                 f'尚待確認：{", ".join(row["missing"]) or "無"}\n'
+                 f'風險試算：本金 {SIM_CAPITAL_USDT:g}U，單筆風險預算 {risk_usdt:.2f}U，參考名義倉位上限 {notional:.2f}U（不含費用）\n'
+                 '僅供研究，非保證成交價；不自動下單。')
         telegram(message)
-        c.execute('INSERT INTO alerts VALUES (?,?,?,?,?)',(*key,datetime.now(timezone.utc).isoformat()))
+        c.execute('INSERT INTO alert_state (venue,symbol,direction,grade,score,active,last_sent_utc,updated_utc) VALUES (?,?,?,?,?,1,?,?) '
+                  'ON CONFLICT(venue,symbol,direction) DO UPDATE SET grade=excluded.grade,score=excluded.score,active=1,last_sent_utc=excluded.last_sent_utc,updated_utc=excluded.updated_utc',
+                  (venue,symbol,row['direction'],row['grade'],row['score'],now.isoformat(),now.isoformat()))
+        c.execute('INSERT OR IGNORE INTO alerts VALUES (?,?,?,?,?)',(venue,symbol,row['direction']+'/'+row['grade'],row['candle'],now.isoformat()))
         return True
+
+def expire_alerts(seen):
+    """Deactivate vanished observations, without spamming per-symbol cancellation alerts."""
+    now=datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB,timeout=30) as c:
+        rows=c.execute('SELECT venue,symbol,direction FROM alert_state WHERE active=1').fetchall()
+        for venue,symbol,direction in rows:
+            if (venue,symbol,direction) not in seen:
+                c.execute('UPDATE alert_state SET active=0,updated_utc=? WHERE venue=? AND symbol=? AND direction=?',
+                          (now,venue,symbol,direction))
+
 
 def record_v5_signal(venue,symbol,result):
     with sqlite3.connect(DB,timeout=30) as c:
@@ -351,7 +407,7 @@ def settle_v5(venue,symbol,d15):
                           (venue,symbol,datetime.fromtimestamp(time.time()-8*86400,timezone.utc).isoformat())).fetchall()
         for direction,grade,candle,entry,stop,target in pending:
             start_ms=int(datetime.fromisoformat(candle).timestamp()*1000)
-            future=d15[d15.close_ms>start_ms]
+            future=d15[(d15.close_ms>start_ms) & (d15.close_ms<=start_ms+24*3600000)]
             if future.empty: continue
             outcome=None; exit_price=None
             for bar in future.itertuples():
@@ -359,7 +415,7 @@ def settle_v5(venue,symbol,d15):
                 hit_tp=bar.high>=target if direction=='偏多' else bar.low<=target
                 if hit_sl: outcome='SL';exit_price=stop;break
                 if hit_tp: outcome='TP';exit_price=target;break
-            if outcome is None and int(future.iloc[-1].close_ms)-start_ms>=24*3600000:
+            if outcome is None and int(future.iloc[-1].close_ms)-start_ms>=24*3600000-60000:
                 outcome='24H';exit_price=float(future.iloc[-1].close)
             if outcome:
                 sign=1 if direction=='偏多' else -1
@@ -391,12 +447,15 @@ def scan_once():
     try:
         extras,missing=equity_universe(venue)
         stats['equity_matched']=len(extras);stats['equity_missing']=missing
-        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing]
+        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing and not any(sym.startswith(x+'-') for sym in VERIFIED_EQUITY_CONTRACTS)]
+        stats['equity_verified']=len(extras)-len(stats['equity_unverified'])
         # The exchange instrument name alone is insufficient proof of equity underlying.
         symbols=list(dict.fromkeys(symbols+extras))
     except Exception as exc:
         stats['notes'].append(f'監控名單查詢失敗: {str(exc)[:80]}')
     watch_sent=0
+    seen=set()
+    evaluated=set()
     for symbol in symbols:
         stats['attempted']+=1
         try:
@@ -410,11 +469,13 @@ def scan_once():
             # Continue legacy tracking for existing V4.5.1 observations.
             track_performance(venue,symbol,d15)
             result=evaluate(d15,d1,d4,d5)
+            evaluated.add((venue,symbol))
             if not result:continue
             is_equity_name=symbol.split('-')[0] in EQUITY_SYMBOLS
-            if is_equity_name and not EQUITY_ALLOW_UNVERIFIED:
+            if is_equity_name and symbol not in VERIFIED_EQUITY_CONTRACTS:
                 LOG.info('EQUITY UNVERIFIED suppressed alert: %s %s score=%s',symbol,result['direction'],result['score'])
                 continue
+            seen.add((venue,symbol,result['direction']))
             if result['grade']=='強訊號':stats['candidates']+=1
             else:stats['watch']+=1
             record_v5_signal(venue,symbol,result)
@@ -425,20 +486,59 @@ def scan_once():
         except Exception as exc:
             stats['errors']+=1
             LOG.warning('%s %s failed: %s',venue,symbol,exc)
+    if evaluated:
+        with sqlite3.connect(DB,timeout=30) as c:
+            for v,sym,direction in c.execute('SELECT venue,symbol,direction FROM alert_state WHERE active=1').fetchall():
+                if (v,sym) in evaluated and (v,sym,direction) not in seen:
+                    c.execute('UPDATE alert_state SET active=0,updated_utc=? WHERE venue=? AND symbol=? AND direction=?',
+                              (datetime.now(timezone.utc).isoformat(),v,sym,direction))
     LOG.info('Scan complete: %s',json.dumps(stats,ensure_ascii=False))
     return stats
 
 def status_message(stats,last_error=None):
-    now=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    now=datetime.now(TZ).strftime('%Y/%m/%d %H:%M 台灣時間')
     rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
-    return (f'📡 BinanceWin V5.0 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+    return (f'📡 BinanceWin V5.1 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
             f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
             f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
             f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
-            f'美股底層未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
+            f'已人工核准合約：{stats.get("equity_verified",0)}｜未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
             f'強訊號：{stats["candidates"]}｜候選/觀察：{stats["watch"]}｜已發通知：{stats["sent"]}\n'
             f'單幣錯誤：{stats["errors"]}｜異常：{last_error or "; ".join(stats["notes"]) or "無"}\n'
             f'歷史模擬：{v5_summary()}\n僅供研究，不自動下單。')
+
+def backup_database():
+    """Consistent SQLite backup on same persistent mount. Local backup is not off-site."""
+    BACKUP_DIR.mkdir(parents=True,exist_ok=True)
+    day=datetime.now(TZ).strftime('%Y-%m-%d')
+    dest=BACKUP_DIR / f'scanner-{day}.sqlite3'
+    if not dest.exists():
+        with sqlite3.connect(DB,timeout=30) as src, sqlite3.connect(dest) as dst:
+            src.backup(dst)
+        LOG.info('SQLite backup created: %s',dest)
+    cutoff=datetime.now(TZ).date()-timedelta(days=BACKUP_KEEP_DAYS)
+    for old in BACKUP_DIR.glob('scanner-????-??-??.sqlite3'):
+        try:
+            if datetime.strptime(old.stem[8:],'%Y-%m-%d').date()<cutoff: old.unlink()
+        except ValueError: pass
+
+def daily_report():
+    """Summary of stored simulated signals, not real filled trades."""
+    since=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()
+    with sqlite3.connect(DB,timeout=30) as c:
+        new=c.execute('SELECT grade,COUNT(*) FROM v5_signals WHERE created_utc>=? GROUP BY grade',(since,)).fetchall()
+        closed=c.execute('SELECT outcome,net_pct FROM v5_signals WHERE settled_utc>=? AND outcome IS NOT NULL',(since,)).fetchall()
+        pending=c.execute('SELECT COUNT(*) FROM v5_signals WHERE outcome IS NULL').fetchone()[0]
+    counts=dict(new)
+    if closed:
+        win=sum(p>0 for _,p in closed)/len(closed)
+        avg=sum(p for _,p in closed)/len(closed)
+        result=f'{len(closed)} 筆｜淨正報酬比例 {win:.1%}｜平均 {avg:+.2f}%'
+    else: result='尚無已結算訊號'
+    return (f'📊 BinanceWin V5.1 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
+            f'近24小時：強訊號 {counts.get("強訊號",0)}｜候選 {counts.get("候選訊號",0)}｜觀察 {counts.get("觀察訊號",0)}\n'
+            f'近24小時結算：{result}\n未結算：{pending} 筆\n'
+            f'歷史強訊號：{v5_summary()}\n模擬不等於實盤，無自動下單。')
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -447,14 +547,15 @@ def due_scan_slot(now):
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
+    LOG.info('DB_PATH=%s persistent_mount_check=%s',DB,DB.parent == Path('/data'))
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V5.0 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V5.0 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    LOG.info('BinanceWin V5.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
@@ -478,6 +579,19 @@ def main():
                     last_stats = json.loads(saved)
                 except ValueError:
                     pass
+        # Backup once per local day; do not report success until SQLite backup finishes.
+        today=datetime.now(TZ).strftime('%Y-%m-%d')
+        if get_state('last_backup_day')!=today:
+            try:
+                backup_database()
+                set_state('last_backup_day',today)
+            except Exception: LOG.exception('SQLite backup failed')
+        local=datetime.now(TZ)
+        if local.hour>=DAILY_REPORT_HOUR and get_state('last_daily_report_day')!=today:
+            try:
+                telegram(daily_report())
+                set_state('last_daily_report_day',today)
+            except Exception: LOG.exception('Daily report failed; will retry')
         # Heartbeat on UTC hour, rather than 3600s after container boot.
         hour = int(time.time() // 3600)
         if get_state('last_heartbeat_hour') != str(hour):
