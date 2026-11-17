@@ -1,4 +1,4 @@
-"""BinanceWin V5.1 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.2 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -16,7 +16,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.1'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.2'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -27,16 +27,16 @@ SCAN_OFFSET = 35
 # Optional explicitly configured exchange-listed equity-linked swaps.
 # Exact symbols must be confirmed from live exchange instrument listings.
 EQUITY_SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('EQUITY_SYMBOLS', 'RKLB,TSLA,SNXX,SNDK,SPCX,MU,MUU,NVDA,NVDL').split(',') if x.strip()))
-WATCH_ALERTS = os.getenv('WATCH_ALERTS', '1') == '1'
+WATCH_ALERTS = os.getenv('WATCH_ALERTS', '0') == '1'
 WATCH_MIN_VOLUME = float(os.getenv('WATCH_MIN_VOLUME', '1.2'))
 WATCH_MAX_PER_SCAN = max(0, min(10, int(os.getenv('WATCH_MAX_PER_SCAN', '3'))))
 FEE_BPS = float(os.getenv('ROUND_TRIP_FEE_BPS', '10'))
 SLIPPAGE_BPS = float(os.getenv('ROUND_TRIP_SLIPPAGE_BPS', '6'))
 ATR_SL = float(os.getenv('ATR_STOP_MULTIPLE', '1.5'))
 RISK_REWARD = float(os.getenv('TAKE_PROFIT_R', '2.0'))
-SCORE_STRONG = int(os.getenv('SCORE_STRONG', '85'))
-SCORE_CANDIDATE = int(os.getenv('SCORE_CANDIDATE', '70'))
-SCORE_WATCH = int(os.getenv('SCORE_WATCH', '55'))
+SCORE_STRONG = int(os.getenv('SCORE_STRONG', '90'))
+SCORE_CANDIDATE = int(os.getenv('SCORE_CANDIDATE', '80'))
+SCORE_WATCH = int(os.getenv('SCORE_WATCH', '70'))
 # Conservative: matching a ticker does NOT verify the tracked equity.
 # Unverified equity-like ticker contracts are always suppressed unless explicitly allowlisted.
 MAX_CANDLE_AGE_MIN = int(os.getenv('MAX_CANDLE_AGE_MIN', '50'))
@@ -53,6 +53,65 @@ SIM_CAPITAL_USDT = float(os.getenv('SIM_CAPITAL_USDT', '150'))
 # Explicit allowlist of independently confirmed instrument IDs; symbol matching alone is NOT verification.
 VERIFIED_EQUITY_CONTRACTS = set(x.strip().upper() for x in os.getenv('VERIFIED_EQUITY_CONTRACTS', '').split(',') if x.strip())
 
+
+
+# Strict filters; all are research heuristics, not validated profit probabilities.
+BREAKOUT_BUFFER_ATR = float(os.getenv('BREAKOUT_BUFFER_ATR', '0.10'))
+MIN_BODY_RATIO = float(os.getenv('MIN_BODY_RATIO', '0.55'))
+STRICT_MIN_VOLUME = float(os.getenv('STRICT_MIN_VOLUME', '1.8'))
+MAX_EXTENSION_ATR = float(os.getenv('MAX_EXTENSION_ATR', '1.8'))
+MAX_ENTRY_DRIFT_ATR = float(os.getenv('MAX_ENTRY_DRIFT_ATR', '0.5'))
+MIN_ROOM_R = float(os.getenv('MIN_ROOM_R', '1.5'))
+MAX_RSI_LONG = float(os.getenv('MAX_RSI_LONG', '72'))
+MIN_RSI_SHORT = float(os.getenv('MIN_RSI_SHORT', '28'))
+# Manual UTC time windows: YYYY-MM-DDTHH:MM/YYYY-MM-DDTHH:MM separated by commas.
+# Keep empty if no independently verified calendar is maintained.
+EVENT_BLACKOUT_UTC = os.getenv('EVENT_BLACKOUT_UTC', '')
+EVENT_WINDOWS = []
+for _window in EVENT_BLACKOUT_UTC.split(','):
+    if not _window.strip(): continue
+    try:
+        _a, _b = _window.strip().split('/')
+        _start = datetime.fromisoformat(_a.replace('Z','+00:00'))
+        _end = datetime.fromisoformat(_b.replace('Z','+00:00'))
+        if _start.tzinfo is None: _start = _start.replace(tzinfo=timezone.utc)
+        if _end.tzinfo is None: _end = _end.replace(tzinfo=timezone.utc)
+        if _end <= _start: raise ValueError('end before start')
+        EVENT_WINDOWS.append((_start.astimezone(timezone.utc),_end.astimezone(timezone.utc)))
+    except Exception as exc:
+        raise ValueError(f'Invalid EVENT_BLACKOUT_UTC window: {_window!r}') from exc
+
+def in_event_blackout(when):
+    when=when.astimezone(timezone.utc)
+    return any(a<=when<=b for a,b in EVENT_WINDOWS)
+
+def strict_conditions(d15, d1h, d4h, d5m, row, past, direction, volatility, volume, rv, trend4, trend1, trend5):
+    sign=1 if direction=='偏多' else -1
+    candle_range=max(float(row.high-row.low),1e-12)
+    body=abs(float(row.close-row.open))/candle_range
+    boundary=float(past.high.max() if sign==1 else past.low.min())
+    breakout=sign*(float(row.close)-boundary)>=BREAKOUT_BUFFER_ATR*volatility
+    candle_color=sign*(float(row.close-row.open))>0
+    ema20=float(d15.close.ewm(span=20,adjust=False).mean().iloc[-1])
+    extension=sign*(float(row.close)-ema20)/volatility
+    # Nearest previous swing resistance/support, excluding the 20-bar breakout window.
+    older=d15.iloc[-81:-21]
+    room_r=None
+    if len(older)>=20:
+        levels=older.high if sign==1 else older.low
+        candidates=levels[levels>float(row.close)] if sign==1 else levels[levels<float(row.close)]
+        if not candidates.empty:
+            nearest=float(candidates.min() if sign==1 else candidates.max())
+            room_r=sign*(nearest-float(row.close))/(ATR_SL*volatility)
+    checks={
+      '4H趨勢':bool(trend4), '1H動能':bool(trend1),'5M確認':bool(trend5),
+      '有效突破':bool(breakout and candle_color and body>=MIN_BODY_RATIO),
+      '放量':bool(volume>=STRICT_MIN_VOLUME),
+      '避免追價':bool(-0.5<=extension<=MAX_EXTENSION_ATR),
+      'RSI不極端':bool(rv<=MAX_RSI_LONG if sign==1 else rv>=MIN_RSI_SHORT),
+      '前方空間':bool(room_r is None or room_r>=MIN_ROOM_R),
+    }
+    return checks,room_r,extension
 
 class MarketError(Exception):
     pass
@@ -250,6 +309,8 @@ def evaluate(d15, d1h, d4h=None, d5m=None, historical=False):
     if not all(np.isfinite(x) for x in (volume,rv,kval,dval,jval,macd1,macd4,ma4,ma5,volatility)) or volatility<=0:
         return None
     results=[]
+    if in_event_blackout(datetime.fromtimestamp(int(row.close_ms)/1000,timezone.utc)):
+        return None
     for direction, sign in [('偏多',1),('偏空',-1)]:
         breakout = row.close > past.high.max() if sign==1 else row.close < past.low.min()
         near = row.close >= past.high.max()-0.5*volatility if sign==1 else row.close <= past.low.min()+0.5*volatility
@@ -259,10 +320,12 @@ def evaluate(d15, d1h, d4h=None, d5m=None, historical=False):
         momentum = sign*(kval-dval)>0
         rsi_ok = rv>=52 if sign==1 else rv<=48
         volume_ok = volume>=1.5
+        checks,room_r,extension = strict_conditions(d15,h,four,five,row,past,direction,volatility,volume,rv,trend4,trend1,trend5)
         # 25 trend + 25 breakout/volume + 20 MACD + 15 RSI + 10 KDJ + 5 liquidity proxy
         score = (15*trend4 + 10*trend5 + 15*breakout + 10*volume_ok + 20*trend1 + 15*rsi_ok + 10*momentum + 5*(base>0))
-        # Require directionally aligned 4h + 1h for trade-grade signals.
-        if score>=SCORE_STRONG and breakout and trend4 and trend1 and volume_ok:
+        # Strict mode: a high numerical score cannot override mandatory safety filters.
+        mandatory=all(checks.values()) and momentum and rsi_ok
+        if score>=SCORE_STRONG and mandatory:
             grade='強訊號'
         elif score>=SCORE_CANDIDATE and trend4 and trend1 and near:
             grade='候選訊號'
@@ -277,7 +340,7 @@ def evaluate(d15, d1h, d4h=None, d5m=None, historical=False):
         missing=[name for name,passed in [('4H趨勢',trend4),('1H動能',trend1),('5M確認',trend5),('突破',breakout),('放量',volume_ok),('RSI',rsi_ok),('KDJ',momentum)] if not passed]
         results.append({'direction':direction,'grade':grade,'score':int(score),'missing':missing,'price':entry,
                         'stop':stop,'target':target,'atr':volatility,'volume':volume,'rsi':rv,'k':kval,'d':dval,
-                        'j':jval,'macd':macd1,'candle':datetime.fromtimestamp(int(row.close_ms)/1000,timezone.utc).isoformat()})
+                        'j':jval,'macd':macd1,'checks':checks,'room_r':room_r,'extension_atr':extension,'candle':datetime.fromtimestamp(int(row.close_ms)/1000,timezone.utc).isoformat()})
     return max(results,key=lambda r:r['score']) if results else None
 
 def save_observation(venue, symbol, result):
@@ -365,18 +428,20 @@ def notify(venue,symbol,row):
                 c.execute('UPDATE alert_state SET grade=?,score=?,updated_utc=? WHERE venue=? AND symbol=? AND direction=?',
                           (row['grade'],row['score'],now.isoformat(),venue,symbol,row['direction']))
                 return False
-        risk_distance=abs(row['price']-row['stop'])
-        risk_usdt=max(0,SIM_CAPITAL_USDT*MAX_RISK_PER_TRADE_PCT/100)
-        notional=min(risk_usdt/(risk_distance/row['price']), SIM_CAPITAL_USDT*MAX_NOTIONAL_PCT/100) if risk_distance else 0
-        message=(f'🔔 BinanceWin V5.1｜{reason}｜{row["grade"]}｜{row["direction"]} {row["score"]}/100\n'
-                 f'交易所：{venue}｜合約：{symbol}\n台灣時間：{tw_time(row["candle"])}（15M 已收盤）\n'
-                 f'參考進場：{fmt_price(row["price"])}｜ATR：{fmt_price(row["atr"])}\n'
-                 f'參考停損：{fmt_price(row["stop"])}｜TP1：{fmt_price(row["price"]+(row["target"]-row["price"])*.75)}（1.5R）'
-                 f'｜TP2：{fmt_price(row["target"])}（{RISK_REWARD:g}R）\n'
-                 f'成交量：{row["volume"]:.2f}×｜RSI：{row["rsi"]:.1f}｜KDJ：{row["k"]:.1f}/{row["d"]:.1f}\n'
-                 f'尚待確認：{", ".join(row["missing"]) or "無"}\n'
-                 f'風險試算：本金 {SIM_CAPITAL_USDT:g}U，單筆風險預算 {risk_usdt:.2f}U，參考名義倉位上限 {notional:.2f}U（不含費用）\n'
-                 '僅供研究，非保證成交價；不自動下單。')
+        checks=row.get('checks',{})
+        passed=sum(bool(x) for x in checks.values())
+        if checks and passed==len(checks): confirmation='全部通過'
+        elif passed: confirmation=f'部分通過 {passed}/{len(checks)}'
+        else: confirmation='未通過'
+        missing=', '.join(k for k,v in checks.items() if not v)
+        tp1=row['price']+(row['target']-row['price'])*(1.5/RISK_REWARD)
+        message=(f'🔔 BinanceWin V5.2｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
+                 f'{venue}｜{symbol}｜{tw_time(row["candle"])}\n'
+                 f'進場參考 {fmt_price(row["price"])}｜SL {fmt_price(row["stop"])}\n'
+                 f'TP1 {fmt_price(tp1)}｜TP2 {fmt_price(row["target"])}\n'
+                 f'量 {row["volume"]:.2f}×｜RSI {row["rsi"]:.1f}｜KDJ {row["k"]:.0f}/{row["d"]:.0f}\n'
+                 f'確認狀態：{confirmation}'+(f'（未過：{missing}）' if missing else '')+'\n'
+                 '研究訊號｜非實際成交｜不自動下單。')
         telegram(message)
         c.execute('INSERT INTO alert_state (venue,symbol,direction,grade,score,active,last_sent_utc,updated_utc) VALUES (?,?,?,?,?,1,?,?) '
                   'ON CONFLICT(venue,symbol,direction) DO UPDATE SET grade=excluded.grade,score=excluded.score,active=1,last_sent_utc=excluded.last_sent_utc,updated_utc=excluded.updated_utc',
@@ -431,6 +496,19 @@ def v5_summary():
     tp=sum(o=='TP' for o,_ in rows);sl=sum(o=='SL' for o,_ in rows)
     return f'{n}筆｜淨報酬為正 {wins/n:.0%}｜平均 {avg:+.2f}%｜TP {tp}／SL {sl}（模擬）'
 
+def live_price(venue,symbol):
+    if venue=='OKX':
+        rows=okx_get('/api/v5/market/ticker',{'instId':symbol})
+        return float(rows[0]['last'])
+    data=bingx_get('/openApi/swap/v2/quote/ticker',{'symbol':symbol})
+    if isinstance(data,list):data=data[0]
+    return float(data['lastPrice'])
+
+def entry_price_safe(venue,symbol,result):
+    price=live_price(venue,symbol)
+    if price<=0 or not np.isfinite(price):return False
+    return abs(price-result['price'])<=MAX_ENTRY_DRIFT_ATR*result['atr']
+
 def scan_once():
     errors=[];venue=None;symbols=[]
     for name,probe in [('OKX',okx_universe),('BingX',bingx_universe)]:
@@ -480,6 +558,9 @@ def scan_once():
             else:stats['watch']+=1
             record_v5_signal(venue,symbol,result)
             if result['grade']=='強訊號' or (WATCH_ALERTS and watch_sent<WATCH_MAX_PER_SCAN):
+                if not entry_price_safe(venue,symbol,result):
+                    LOG.info('ENTRY DRIFT filtered: %s',symbol)
+                    continue
                 if notify(venue,symbol,result):
                     stats['sent']+=1
                     if result['grade']!='強訊號':watch_sent+=1
@@ -498,14 +579,14 @@ def scan_once():
 def status_message(stats,last_error=None):
     now=datetime.now(TZ).strftime('%Y/%m/%d %H:%M 台灣時間')
     rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
-    return (f'📡 BinanceWin V5.1 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+    return (f'📡 BinanceWin V5.2 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
             f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
             f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
             f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
             f'已人工核准合約：{stats.get("equity_verified",0)}｜未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
             f'強訊號：{stats["candidates"]}｜候選/觀察：{stats["watch"]}｜已發通知：{stats["sent"]}\n'
             f'單幣錯誤：{stats["errors"]}｜異常：{last_error or "; ".join(stats["notes"]) or "無"}\n'
-            f'歷史模擬：{v5_summary()}\n僅供研究，不自動下單。')
+            f'歷史模擬（假設成交）：{v5_summary()}\n僅供研究，不自動下單。')
 
 def backup_database():
     """Consistent SQLite backup on same persistent mount. Local backup is not off-site."""
@@ -535,7 +616,7 @@ def daily_report():
         avg=sum(p for _,p in closed)/len(closed)
         result=f'{len(closed)} 筆｜淨正報酬比例 {win:.1%}｜平均 {avg:+.2f}%'
     else: result='尚無已結算訊號'
-    return (f'📊 BinanceWin V5.1 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
+    return (f'📊 BinanceWin V5.2 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
             f'近24小時：強訊號 {counts.get("強訊號",0)}｜候選 {counts.get("候選訊號",0)}｜觀察 {counts.get("觀察訊號",0)}\n'
             f'近24小時結算：{result}\n未結算：{pending} 筆\n'
             f'歷史強訊號：{v5_summary()}\n模擬不等於實盤，無自動下單。')
@@ -549,13 +630,13 @@ def main():
     init_db()
     LOG.info('DB_PATH=%s persistent_mount_check=%s',DB,DB.parent == Path('/data'))
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V5.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.2 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V5.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    LOG.info('BinanceWin V5.2 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:

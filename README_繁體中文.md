@@ -1,51 +1,45 @@
-# BinanceWin V5.1｜平衡型智慧合約研究雷達
+# BinanceWin V5.2 嚴格型｜Railway 部署指南
 
-本版以實際提供的 `BinanceWin_V5.0_Final.zip` 之 `worker.py` 為基礎修訂。只使用公開市場資料；**不會自動下單**、不使用交易 API 金鑰，也不保證獲利。
+## 版本來源
+以本次可檢查的 `BinanceWin_V5.1_Final/worker.py` 為基礎修改，保留原有資料庫表、API 與 Railway 執行方式。**尚未實際連接使用者的 GitHub/Railway 或交易所 API**。
 
-## 功能與限制
+## 新增功能
+- Telegram 簡化：移除本金／風險預算／名義倉位試算；「確認狀態」顯示全部通過、部分通過、未通過；仍保留 SL、TP1、TP2、量、RSI、KDJ。
+- 嚴格型強訊號：預設 90 分，且 4H、1H、5M 同向，收盤有效突破前 20 根 K 棒極值（突破緩衝 0.1 ATR）、實體佔 K 棒至少 55%、成交量 ≥ 1.8 倍、避免 RSI 極端、價格過度偏離 EMA20、前方歷史價位有足夠空間。
+- 預設僅推播強訊號；候選／觀察仍記錄資料庫，若要開啟觀察通知可設 `WATCH_ALERTS=1`。
+- 發通知前另抓即時 ticker，若偏離訊號收盤參考價超過 0.5 ATR 則不通知，避免提示過時價格。這是通知過濾，並非實際可成交價格保證。
+- 手動重大事件黑窗 `EVENT_BLACKOUT_UTC`，不會自行抓取 CPI／FOMC／非農行事曆。未設定時不啟用，**不能聲稱已自動避開新聞**。
+- 延續 OKX 優先／BingX 備援、15 分鐘掃描、SQLite 模擬追蹤與每日報告、每日 SQLite 備份、九代號 RKLB TSLA SNXX SNDK SPCX MU MUU NVDA NVDL。僅名稱匹配不代表美股底層驗證，未人工驗證預設禁止通知。
 
-- OKX 優先、BingX 故障時備援；每 15 分鐘掃描一次，熱門 USDT 永續合約前 30 名，另納入 9 個指定代號，合約去重後統計。
-- 4H／1H／15M／5M **已收盤** K 線、MACD／RSI／KDJ／成交量／突破評分。85 分且符合趨勢、突破、放量才列強訊號；70 分候選、55 分觀察。分數不是勝率。
-- 同標的同方向智慧通知：首次發現、升級強訊號、評分比前次至少增加 15 分，或強訊號持續超過 120 分鐘才提醒。訊號消失會在資料庫標記失效，但不逐筆洗版；若 Telegram 發送失敗不記錄成功。每輪最多 3 則非強訊號通知。
-- ATR(14)×1.5 參考停損，TP1=1.5R、TP2=2R；停損距離超過價格 5% 不發訊號。附單筆風險預算／名義倉位上限示例，**不是下單建議或保證最大虧損**；槓桿、費用、滑價、跳空與爆倉可能造成更多損失。
-- SQLite 保留訊號與模擬結算；每晚 21:00 台灣時間寄送每日報告；每小時狀態報告。模擬以 15M K 線高低點判斷 TP/SL，同根兩者皆觸及時先算 SL；24H 超時按收盤價，扣假設手續費與滑價。這不是實際成交績效，且先前 V5.0 既有模擬紀錄會保留。
-- `backtest.py` 是沿用 V5.0 的 CSV 離線回測工具，需自行提供 5M、15M、1H、4H 歷史 CSV；沒有實際歷史資料時不會產生可靠勝率。
-- 九個指定代號：`RKLB,TSLA,SNXX,SNDK,SPCX,MU,MUU,NVDA,NVDL`。**交易所上架同名合約並不能驗證其追蹤股票／ETF。** 預設不發這九個同名合約的交易告警。僅在查閱交易所官方合約規格、核對底層標的與風險後，才可將實際合約 ID 填入 `VERIFIED_EQUITY_CONTRACTS`；這是人工核准清單，程式本身沒有獨立驗證官方文件。
+## 更新流程（先備份）
+1. 在 GitHub 將目前 V5.1 `worker.py`、`backtest.py`、`requirements.txt` 下載備份；不要刪除舊的 SQLite。
+2. 將本 ZIP 的 `worker.py`、`backtest.py`、`requirements.txt`、`test_v52.py` 上傳到原本 GitHub repository 的根目錄（不要再建新專案）。
+3. Railway 維持原有 GitHub main 自動部署；啟動命令 `python worker.py`；原有 `TELEGRAM_BOT_TOKEN` 與 `TELEGRAM_CHAT_ID` 不需重新公開或貼給任何人。
+4. 部署後檢查 Logs 有 `BinanceWin V5.2 started`，Telegram 應出現精簡訊息；未出現強訊號不等於故障，查看每小時狀態與掃描 Logs。
+5. 先確認 Volume 已掛載到 `/data`，才將 `DB_PATH=/data/scanner.sqlite3` 與 `BACKUP_DIR=/data/backups` 設為 Railway Variables。**變更路徑前須先搬移既有 SQLite，否則會像是紀錄消失。** 每日備份若和主 DB 在同一 Volume，不算異地備份。
+6. 請勿設定 `ONCE=1` 或 `TEST_TELEGRAM=1` 作為常駐模式。`WATCH_ALERTS=0` 為預設；如有需求再開啟。
 
-## Railway 手機部署
-
-1. **先備份** GitHub 的 `worker.py`、`requirements.txt`，並評估現有 SQLite 紀錄是否需先匯出。不要在 GitHub 上傳 `.env` 或 Bot Token。
-2. 將 ZIP 內 `worker.py`、`requirements.txt` 覆蓋 GitHub 根目錄同名檔案；`backtest.py` 可一併更新。保留 `python worker.py` 作為 Railway Start Command。
-3. 保留 Railway Variables 中 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`、`TOP_N=30`、`ONCE=0`、`TEST_TELEGRAM=0`。若設了 `EQUITY_SYMBOLS`，確認九個代號齊全。
-4. **持久化儲存必須先建立 Railway Volume，掛載 `/data`，才設定 `DB_PATH=/data/scanner.sqlite3` 與 `BACKUP_DIR=/data/backups`。** 只設定 DB_PATH 而未掛載 Volume，無法保證跨部署保存。若已有舊 SQLite，**改路徑不會自動搬移**，請先從舊部署匯出資料庫再移入 Volume；否則新路徑會建立空白 DB。Railway Trial 是否支援 Volume 依當前方案及介面為準。
-5. 部署後檢查 Railway Logs：`BinanceWin V5.1 started`、`DB_PATH=...`、`Scan complete`，再確認 Telegram 訊號與每日報告。
-6. 預設會每天產生一份 SQLite 一致性備份並保留 14 天；**若 BACKUP_DIR 不在持久化 Volume，備份也會隨部署消失。** 同一個 Volume 的備份不是異地備份；若 Volume 被刪除仍會一併遺失，建議定期下載到外部儲存。
-
-## 可選 Variables（可不新增，程式有預設值）
-
-| 變數 | 預設 | 說明 |
+## 嚴格型參數（環境變數，可選）
+| 名稱 | 預設 | 用途 |
 |---|---|---|
-| `ALERT_COOLDOWN_MIN` | `120` | 強訊號持續提醒冷卻分鐘 |
-| `SCORE_CHANGE_ALERT` | `15` | 分數增強提醒門檻 |
-| `WATCH_MAX_PER_SCAN` | `3` | 每輪非強訊號最多通知 |
-| `DAILY_REPORT_HOUR_TW` | `21` | 台灣時間每日報告小時 |
-| `MAX_STOP_PCT` | `5` | ATR 停損距離超過此百分比不發訊號 |
-| `SIM_CAPITAL_USDT` | `150` | 純研究風險試算本金 |
-| `MAX_RISK_PER_TRADE_PCT` | `1` | 單筆研究風險預算百分比 |
-| `MAX_NOTIONAL_PCT` | `100` | 研究名義倉位占本金上限百分比 |
-| `BACKUP_KEEP_DAYS` | `14` | 本地每日備份保留天數 |
-| `VERIFIED_EQUITY_CONTRACTS` | 空 | **人工查核後**才填入交易所合約 ID，例：`TSLA-USDT-SWAP`（僅為格式示例，非已驗證標的） |
+| SCORE_STRONG | 90 | 強訊號門檻，另需全部嚴格條件通過 |
+| STRICT_MIN_VOLUME | 1.8 | 放量倍率 |
+| BREAKOUT_BUFFER_ATR | 0.10 | 突破緩衝 ATR 倍數 |
+| MIN_BODY_RATIO | 0.55 | K 棒實體／全長下限 |
+| MAX_EXTENSION_ATR | 1.8 | 距 EMA20 順勢延伸上限 |
+| MAX_ENTRY_DRIFT_ATR | 0.5 | 通知前價格漂移上限 |
+| MIN_ROOM_R | 1.5 | 前方歷史價位的最小空間（R） |
+| MAX_RSI_LONG | 72 | 偏多 RSI 上限 |
+| MIN_RSI_SHORT | 28 | 偏空 RSI 下限 |
+| WATCH_ALERTS | 0 | 預設不推播候選／觀察 |
+| EVENT_BLACKOUT_UTC | 空白 | 手動事件時間窗，UTC 起訖，以逗號分隔 |
 
-## 本機測試
+事件黑窗範例：`2026-12-01T12:00Z/2026-12-01T14:00Z,2026-12-02T18:00Z/2026-12-02T20:00Z`（僅格式示範，**不是實際事件時間**）。
 
-```bash
-pip install -r requirements.txt
-python -m py_compile worker.py backtest.py
-python test_v51.py
-```
+## 回測與績效注意
+`python backtest.py --folder data --symbol BTC-USDT-SWAP --out results.csv`；CSV 檔案需提供同名 5m、15m、1h、4h 四個時間週期，欄位詳見 `backtest.py`。回測使用下一根 15M 開盤模擬進場，假設固定手續費、滑價、24h 出場，同根同時觸及 TP／SL 時先算 SL。它**不是實際成交紀錄**，未考慮資金費率、委託簿深度與跳空穿價，且不代表策略已獲利。
 
-## 仍需實際驗證
+重要：原 V5.1 的 `settle_v5` 使用訊號收盤價作為假設成交價，未確認實際掛單成交。資料庫裡的舊紀錄與新紀錄都應標示為**模擬結果**，不可當作真實勝率。
 
-- 本環境無法連線 OKX、BingX、Telegram 或 Railway，因此未實測交易所即時回傳格式、網路錯誤重試與真實通知。
-- 未取得交易所官方文件證實九個代號的底層資產；目前全部屬於未驗證，不應視為美股可交易保證。
-- 回測工具沒有真實訂單簿、資金費率、交易所合約規格、跳空或清算模擬；請勿將研究分數或模擬勝率當成實盤保證。
+## 測試
+在本機或 CI 執行 `python -m unittest test_v52.py`，以及 `python -m py_compile worker.py backtest.py`。部署後仍須驗證 API、Telegram、SQLite 寫入與備份。
