@@ -43,3 +43,13 @@
 
 ## 測試
 在本機或 CI 執行 `python -m unittest test_v52.py`，以及 `python -m py_compile worker.py backtest.py`。部署後仍須驗證 API、Telegram、SQLite 寫入與備份。
+
+
+## V5.2.1：九個 OKX 代號對照更新
+
+已依使用者提供的交易對名稱，建立明確的 OKX 永續合約 ID 對照：
+RKLB-USDT-SWAP、TSLA-USDT-SWAP、SNXX-USDT-SWAP、SNDK-USDT-SWAP、SPCX-USDT-SWAP、MU-USDT-SWAP、MUU-USDT-SWAP、NVDA-USDT-SWAP、NVDL-USDT-SWAP。
+
+注意：這九個 ID 在原版 V5.2 已經符合預設名稱匹配規則。本次改為顯式對照、加入交易所回傳的合約元資料日誌，並修正已核准合約數量的精確比對。**名稱匹配不代表已證明底層美股或 ETF 身分。** 預設 `VERIFIED_EQUITY_CONTRACTS` 留空，九個代號的訊號會繼續被保護性抑制。只有在自行獨立核實官方合約規格、且確定適合後，才將實際合約 ID 加入該變數（以逗號分隔）。不要直接把九個全部加入當作驗證。
+
+部署：備份舊版後將 ZIP 內 `worker.py` 與其他檔案上傳原 GitHub 專案，啟動指令仍為 `python worker.py`。不需要新增 API key，不自動下單。觀察 Logs 中 `OKX CONTRACT METADATA` 與 `WATCHLIST SYMBOL FOUND`，確認是否仍列為 `underlying unverified`。

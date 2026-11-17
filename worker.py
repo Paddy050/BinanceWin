@@ -1,4 +1,4 @@
-"""BinanceWin V5.2 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.2.1 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -16,7 +16,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.2'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.2.1'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -27,6 +27,15 @@ SCAN_OFFSET = 35
 # Optional explicitly configured exchange-listed equity-linked swaps.
 # Exact symbols must be confirmed from live exchange instrument listings.
 EQUITY_SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('EQUITY_SYMBOLS', 'RKLB,TSLA,SNXX,SNDK,SPCX,MU,MUU,NVDA,NVDL').split(',') if x.strip()))
+# Explicit exchange instrument mapping. These are symbol IDs, NOT proof of the underlying asset.
+OKX_EQUITY_INST_IDS = {
+    'RKLB': 'RKLB-USDT-SWAP', 'TSLA': 'TSLA-USDT-SWAP',
+    'SNXX': 'SNXX-USDT-SWAP', 'SNDK': 'SNDK-USDT-SWAP',
+    'SPCX': 'SPCX-USDT-SWAP', 'MU': 'MU-USDT-SWAP',
+    'MUU': 'MUU-USDT-SWAP', 'NVDA': 'NVDA-USDT-SWAP',
+    'NVDL': 'NVDL-USDT-SWAP',
+}
+
 WATCH_ALERTS = os.getenv('WATCH_ALERTS', '0') == '1'
 WATCH_MIN_VOLUME = float(os.getenv('WATCH_MIN_VOLUME', '1.2'))
 WATCH_MAX_PER_SCAN = max(0, min(10, int(os.getenv('WATCH_MAX_PER_SCAN', '3'))))
@@ -260,7 +269,11 @@ def equity_universe(venue):
         live = [x['instId'] for x in instruments
                 if x.get('state') == 'live' and x.get('settleCcy') == 'USDT'
                 and x.get('instId', '').endswith('-USDT-SWAP')]
-        template = lambda ticker: ticker + '-USDT-SWAP'
+        for inst in instruments:
+            if inst.get('instId') in OKX_EQUITY_INST_IDS.values():
+                LOG.info('OKX CONTRACT METADATA (not equity verification): %s',
+                         json.dumps({k:inst.get(k) for k in ('instId','instType','state','settleCcy','ctValCcy','ctVal','uly','instFamily')},ensure_ascii=False))
+        template = lambda ticker: OKX_EQUITY_INST_IDS.get(ticker, ticker + '-USDT-SWAP')
     else:
         contracts = bingx_get('/openApi/swap/v2/quote/contracts')
         if isinstance(contracts, dict):
@@ -435,7 +448,7 @@ def notify(venue,symbol,row):
         else: confirmation='未通過'
         missing=', '.join(k for k,v in checks.items() if not v)
         tp1=row['price']+(row['target']-row['price'])*(1.5/RISK_REWARD)
-        message=(f'🔔 BinanceWin V5.2｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
+        message=(f'🔔 BinanceWin V5.2.1｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
                  f'{venue}｜{symbol}｜{tw_time(row["candle"])}\n'
                  f'進場參考 {fmt_price(row["price"])}｜SL {fmt_price(row["stop"])}\n'
                  f'TP1 {fmt_price(tp1)}｜TP2 {fmt_price(row["target"])}\n'
@@ -525,7 +538,7 @@ def scan_once():
     try:
         extras,missing=equity_universe(venue)
         stats['equity_matched']=len(extras);stats['equity_missing']=missing
-        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing and not any(sym.startswith(x+'-') for sym in VERIFIED_EQUITY_CONTRACTS)]
+        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing and (OKX_EQUITY_INST_IDS.get(x, x+'-USDT-SWAP') if venue=='OKX' else x+'-USDT') not in VERIFIED_EQUITY_CONTRACTS]
         stats['equity_verified']=len(extras)-len(stats['equity_unverified'])
         # The exchange instrument name alone is insufficient proof of equity underlying.
         symbols=list(dict.fromkeys(symbols+extras))
@@ -579,7 +592,7 @@ def scan_once():
 def status_message(stats,last_error=None):
     now=datetime.now(TZ).strftime('%Y/%m/%d %H:%M 台灣時間')
     rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
-    return (f'📡 BinanceWin V5.2 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+    return (f'📡 BinanceWin V5.2.1 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
             f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
             f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
             f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
@@ -616,7 +629,7 @@ def daily_report():
         avg=sum(p for _,p in closed)/len(closed)
         result=f'{len(closed)} 筆｜淨正報酬比例 {win:.1%}｜平均 {avg:+.2f}%'
     else: result='尚無已結算訊號'
-    return (f'📊 BinanceWin V5.2 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
+    return (f'📊 BinanceWin V5.2.1 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
             f'近24小時：強訊號 {counts.get("強訊號",0)}｜候選 {counts.get("候選訊號",0)}｜觀察 {counts.get("觀察訊號",0)}\n'
             f'近24小時結算：{result}\n未結算：{pending} 筆\n'
             f'歷史強訊號：{v5_summary()}\n模擬不等於實盤，無自動下單。')
@@ -630,13 +643,13 @@ def main():
     init_db()
     LOG.info('DB_PATH=%s persistent_mount_check=%s',DB,DB.parent == Path('/data'))
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V5.2 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.2.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V5.2 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    LOG.info('BinanceWin V5.2.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
