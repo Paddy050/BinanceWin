@@ -1,4 +1,4 @@
-"""BinanceWin V5.2.1 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.3 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -448,7 +448,7 @@ def notify(venue,symbol,row):
         else: confirmation='未通過'
         missing=', '.join(k for k,v in checks.items() if not v)
         tp1=row['price']+(row['target']-row['price'])*(1.5/RISK_REWARD)
-        message=(f'🔔 BinanceWin V5.2.1｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
+        message=(f'🔔 BinanceWin V5.3｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
                  f'{venue}｜{symbol}｜{tw_time(row["candle"])}\n'
                  f'進場參考 {fmt_price(row["price"])}｜SL {fmt_price(row["stop"])}\n'
                  f'TP1 {fmt_price(tp1)}｜TP2 {fmt_price(row["target"])}\n'
@@ -522,84 +522,96 @@ def entry_price_safe(venue,symbol,result):
     if price<=0 or not np.isfinite(price):return False
     return abs(price-result['price'])<=MAX_ENTRY_DRIFT_ATR*result['atr']
 
+from strategy53 import assess, simulate
+
+def init53():
+    with sqlite3.connect(DB) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS v53 (venue TEXT,symbol TEXT,mode TEXT,exit_mode TEXT,t INTEGER,grade TEXT,payload TEXT,outcome TEXT,net REAL,r REAL,exit_ms INTEGER,PRIMARY KEY(venue,symbol,mode,exit_mode,t))")
+        c.execute("CREATE TABLE IF NOT EXISTS oi53 (venue TEXT,symbol TEXT,t INTEGER,oi REAL,PRIMARY KEY(venue,symbol,t))")
+
+def derivatives(venue,symbol,t):
+    oi=funding=None
+    try:
+        if venue=='OKX':
+            x=okx_get('/api/v5/public/open-interest',{'instType':'SWAP','instId':symbol})[0]; value=float(x['oi']); stamp=int(x['ts'])
+        else:
+            x=bingx_get('/openApi/swap/v2/quote/openInterest',{'symbol':symbol});value=float(x['openInterest']);stamp=int(time.time()*1000)
+        with sqlite3.connect(DB) as c:
+            old=c.execute('SELECT oi FROM oi53 WHERE venue=? AND symbol=? AND t BETWEEN ? AND ? ORDER BY t DESC LIMIT 1',(venue,symbol,stamp-4500000,stamp-3600000)).fetchone()
+            c.execute('INSERT OR IGNORE INTO oi53 VALUES(?,?,?,?)',(venue,symbol,stamp,value))
+        if old and old[0]>0:oi=value/old[0]-1
+    except Exception: LOG.warning('OI unavailable %s',symbol)
+    try:
+        if venue=='OKX':funding=float(okx_get('/api/v5/public/funding-rate',{'instId':symbol})[0]['fundingRate'])
+        else:funding=float(bingx_get('/openApi/swap/v2/quote/premiumIndex',{'symbol':symbol})['lastFundingRate'])
+    except Exception:LOG.warning('Funding unavailable %s',symbol)
+    return oi,funding
+
+def settle53(venue,symbol,d):
+    with sqlite3.connect(DB) as c:
+        for mode,ex,t,payload in c.execute('SELECT mode,exit_mode,t,payload FROM v53 WHERE venue=? AND symbol=? AND outcome IS NULL',(venue,symbol)).fetchall():
+            result=simulate(json.loads(payload),d,FEE_BPS+SLIPPAGE_BPS,ex)
+            if result:c.execute('UPDATE v53 SET outcome=?,net=?,r=?,exit_ms=? WHERE venue=? AND symbol=? AND mode=? AND exit_mode=? AND t=?',(result['outcome'],result.get('net_pct'),result.get('r'),result.get('exit_ms'),venue,symbol,mode,ex,t))
+
 def scan_once():
-    errors=[];venue=None;symbols=[]
+    init53(); notes=[];venue=None
     for name,probe in [('OKX',okx_universe),('BingX',bingx_universe)]:
         try:
-            symbols=probe()
-            if len(candles(name,symbols[0],'15m',60))<40:raise MarketError('Insufficient probe candles')
-            venue=name;break
-        except Exception as exc:
-            errors.append(f'{name}: {str(exc)[:100]}');LOG.warning('%s unavailable: %s',name,exc)
-    stats={'venue':venue or 'NONE','attempted':0,'successful':0,'crypto_listed':len(symbols),'equity_matched':0,
-           'equity_missing':EQUITY_SYMBOLS[:],'equity_verified':0,'equity_unverified':[],
-           'candidates':0,'watch':0,'sent':0,'errors':0,'notes':errors}
+            symbols=probe();candles(name,symbols[0],'15m',60);venue=name;break
+        except Exception:notes.append(name+' unavailable')
+    stats=dict(venue=venue or 'NONE',attempted=0,successful=0,crypto_listed=0,equity_matched=0,equity_missing=EQUITY_SYMBOLS[:],equity_verified=0,equity_unverified=[],candidates=0,watch=0,sent=0,errors=0,notes=notes)
     if not venue:return stats
+    stats['crypto_listed']=len(symbols);extras=[]
     try:
-        extras,missing=equity_universe(venue)
-        stats['equity_matched']=len(extras);stats['equity_missing']=missing
-        stats['equity_unverified']=[x for x in EQUITY_SYMBOLS if x not in missing and (OKX_EQUITY_INST_IDS.get(x, x+'-USDT-SWAP') if venue=='OKX' else x+'-USDT') not in VERIFIED_EQUITY_CONTRACTS]
-        stats['equity_verified']=len(extras)-len(stats['equity_unverified'])
-        # The exchange instrument name alone is insufficient proof of equity underlying.
-        symbols=list(dict.fromkeys(symbols+extras))
-    except Exception as exc:
-        stats['notes'].append(f'監控名單查詢失敗: {str(exc)[:80]}')
-    watch_sent=0
-    seen=set()
-    evaluated=set()
-    for symbol in symbols:
+        extras,missing=equity_universe(venue);stats.update(equity_matched=len(extras),equity_missing=missing,equity_verified=sum(x in VERIFIED_EQUITY_CONTRACTS for x in extras),equity_unverified=[x for x in extras if x not in VERIFIED_EQUITY_CONTRACTS])
+    except Exception:notes.append('指定合約查詢失敗')
+    btc=None
+    try:
+        bs='BTC-USDT-SWAP' if venue=='OKX' else 'BTC-USDT'; bh=candles(venue,bs,'1h',110);bf=candles(venue,bs,'4h',110); a=float(macd_hist(bh.close).iloc[-1]);b=float(macd_hist(bf.close).iloc[-1]);btc=1 if a>0 and b>0 else -1 if a<0 and b<0 else 0
+    except Exception:notes.append('BTC方向缺失')
+    with sqlite3.connect(DB) as c:pending=[x[0] for x in c.execute('SELECT DISTINCT symbol FROM v53 WHERE venue=? AND outcome IS NULL',(venue,))]
+    ranked=[]; universe=list(dict.fromkeys(symbols+extras))
+    for symbol in list(dict.fromkeys(universe+pending)):
         stats['attempted']+=1
         try:
-            d15=candles(venue,symbol,'15m',220)
-            d1=candles(venue,symbol,'1h',110)
-            d4=candles(venue,symbol,'4h',110)
-            d5=candles(venue,symbol,'5m',110)
-            if min(len(d15),len(d1),len(d4),len(d5))<40:raise MarketError('Insufficient history')
-            stats['successful']+=1
-            settle_v5(venue,symbol,d15)
-            # Continue legacy tracking for existing V4.5.1 observations.
-            track_performance(venue,symbol,d15)
-            result=evaluate(d15,d1,d4,d5)
-            evaluated.add((venue,symbol))
-            if not result:continue
-            is_equity_name=symbol.split('-')[0] in EQUITY_SYMBOLS
-            if is_equity_name and symbol not in VERIFIED_EQUITY_CONTRACTS:
-                LOG.info('EQUITY UNVERIFIED suppressed alert: %s %s score=%s',symbol,result['direction'],result['score'])
-                continue
-            seen.add((venue,symbol,result['direction']))
-            if result['grade']=='強訊號':stats['candidates']+=1
-            else:stats['watch']+=1
-            record_v5_signal(venue,symbol,result)
-            if result['grade']=='強訊號' or (WATCH_ALERTS and watch_sent<WATCH_MAX_PER_SCAN):
-                if not entry_price_safe(venue,symbol,result):
-                    LOG.info('ENTRY DRIFT filtered: %s',symbol)
-                    continue
-                if notify(venue,symbol,result):
-                    stats['sent']+=1
-                    if result['grade']!='強訊號':watch_sent+=1
-        except Exception as exc:
-            stats['errors']+=1
-            LOG.warning('%s %s failed: %s',venue,symbol,exc)
-    if evaluated:
-        with sqlite3.connect(DB,timeout=30) as c:
-            for v,sym,direction in c.execute('SELECT venue,symbol,direction FROM alert_state WHERE active=1').fetchall():
-                if (v,sym) in evaluated and (v,sym,direction) not in seen:
-                    c.execute('UPDATE alert_state SET active=0,updated_utc=? WHERE venue=? AND symbol=? AND direction=?',
-                              (datetime.now(timezone.utc).isoformat(),v,sym,direction))
-    LOG.info('Scan complete: %s',json.dumps(stats,ensure_ascii=False))
-    return stats
+            d=candles(venue,symbol,'15m',220);settle53(venue,symbol,d);settle_v5(venue,symbol,d)
+            if symbol not in universe:stats['successful']+=1;continue
+            h=candles(venue,symbol,'1h',110);f=candles(venue,symbol,'4h',110);m=candles(venue,symbol,'5m',110)
+            if min(map(len,(d,h,f,m)))<40 or time.time()*1000-int(d.iloc[-1].close_ms)>MAX_CANDLE_AGE_MIN*60000:raise MarketError('stale/short history')
+            stats['successful']+=1; equity=symbol.split('-')[0] in EQUITY_SYMBOLS
+            if equity and symbol not in VERIFIED_EQUITY_CONTRACTS:continue
+            oi,fr=derivatives(venue,symbol,int(d.iloc[-1].close_ms))
+            for r in assess(__import__("sys").modules[__name__],d,h,f,m,btc,oi,fr,equity):
+                if r['mode']=='strict':
+                    if r['grade']=='強訊號':stats['candidates']+=1;ranked.append((symbol,r))
+                    else:stats['watch']+=1
+                with sqlite3.connect(DB) as c:
+                    for ex in ('fixed','breakeven','trailing'):
+                        if r['grade']!='強訊號' and ex!='fixed':continue
+                        if c.execute('SELECT 1 FROM v53 WHERE venue=? AND symbol=? AND mode=? AND exit_mode=? AND grade=? AND outcome IS NULL',(venue,symbol,r['mode'],ex,r['grade'])).fetchone():continue
+                        c.execute('INSERT OR IGNORE INTO v53 VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)',(venue,symbol,r['mode'],ex,r['t'],r['grade'],json.dumps(r,default=float)))
+        except Exception as e:stats['errors']+=1;LOG.warning('scan %s: %s',symbol,e)
+    for symbol,r in sorted(ranked,key=lambda x:(x[1]['score'],x[1]['adx'],x[1]['volume']),reverse=True)[:3]:
+        try:
+            key='v53_alert_'+venue+symbol+r['direction']; last=get_state(key)
+            if last and time.time()-float(last)<ALERT_COOLDOWN_MIN*60:continue
+            if not r['lo']<=live_price(venue,symbol)<=r['hi']:continue
+            telegram(f"🎯 BinanceWin V5.3｜{symbol} {r['direction']} {r['score']}分\n進場 {r['lo']:.6g}～{r['hi']:.6g}｜SL {r['stop']:.6g}｜TP {r['target']:.6g}\nADX {r['adx']:.1f}｜放量 {r['volume']:.2f}×｜OI {r['oi']:+.1%}｜費率 {r['funding']:.4%}\n確認狀態：全部通過｜回踩 {'是' if r['retest'] else '否'}\n僅供研究，不自動下單")
+            set_state(key,time.time());stats['sent']+=1
+        except Exception:LOG.warning('alert failed %s',symbol)
+    LOG.info('Scan complete: %s',json.dumps(stats,ensure_ascii=False));return stats
 
 def status_message(stats,last_error=None):
     now=datetime.now(TZ).strftime('%Y/%m/%d %H:%M 台灣時間')
     rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
-    return (f'📡 BinanceWin V5.2.1 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+    return (f'📡 BinanceWin V5.3 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
             f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
             f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
             f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
             f'已人工核准合約：{stats.get("equity_verified",0)}｜未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
             f'強訊號：{stats["candidates"]}｜候選/觀察：{stats["watch"]}｜已發通知：{stats["sent"]}\n'
             f'單幣錯誤：{stats["errors"]}｜異常：{last_error or "; ".join(stats["notes"]) or "無"}\n'
-            f'歷史模擬（假設成交）：{v5_summary()}\n僅供研究，不自動下單。')
+            f'舊版歷史模擬（假設成交）：{v5_summary()}\n僅供研究，不自動下單。')
 
 def backup_database():
     """Consistent SQLite backup on same persistent mount. Local backup is not off-site."""
@@ -616,7 +628,7 @@ def backup_database():
             if datetime.strptime(old.stem[8:],'%Y-%m-%d').date()<cutoff: old.unlink()
         except ValueError: pass
 
-def daily_report():
+def legacy_daily_report():
     """Summary of stored simulated signals, not real filled trades."""
     since=(datetime.now(timezone.utc)-timedelta(days=1)).isoformat()
     with sqlite3.connect(DB,timeout=30) as c:
@@ -629,10 +641,25 @@ def daily_report():
         avg=sum(p for _,p in closed)/len(closed)
         result=f'{len(closed)} 筆｜淨正報酬比例 {win:.1%}｜平均 {avg:+.2f}%'
     else: result='尚無已結算訊號'
-    return (f'📊 BinanceWin V5.2.1 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
+    return (f'📊 BinanceWin V5.3 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
             f'近24小時：強訊號 {counts.get("強訊號",0)}｜候選 {counts.get("候選訊號",0)}｜觀察 {counts.get("觀察訊號",0)}\n'
             f'近24小時結算：{result}\n未結算：{pending} 筆\n'
             f'歷史強訊號：{v5_summary()}\n模擬不等於實盤，無自動下單。')
+
+def daily_report():
+    from backtest import metrics
+    lines=['📊 BinanceWin V5.3 每日研究報告（累計；未含資金費實際結算）']
+    with sqlite3.connect(DB) as c:
+        groups=c.execute('SELECT DISTINCT mode,exit_mode,grade FROM v53').fetchall()
+        ranking=[]
+        for mode,ex,grade in groups:
+            rows=c.execute('SELECT net,r FROM v53 WHERE mode=? AND exit_mode=? AND grade=? AND net IS NOT NULL ORDER BY exit_ms',(mode,ex,grade)).fetchall()
+            if not rows:continue
+            m=metrics([{'net_pct':x[0]} for x in rows]);pf=m['profit_factor'];avg_r=sum(x[1] for x in rows)/len(rows)
+            line=f"{mode}/{ex}/{grade} {len(rows)}筆｜正報酬 {m['positive_net_rate']:.0%}｜平均R {avg_r:+.2f}｜PF {pf:.2f}" if pf is not None else f"{mode}/{ex}/{grade} {len(rows)}筆｜平均R {avg_r:+.2f}｜PF 無虧損"
+            ranking.append((avg_r,line))
+        lines.extend(x[1] for x in sorted(ranking,reverse=True));lines.append('未結算 '+str(c.execute('SELECT COUNT(*) FROM v53 WHERE outcome IS NULL').fetchone()[0]))
+    return '\n'.join(lines+['排名僅供研究；非實盤績效。'])[:3900]
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -641,33 +668,34 @@ def due_scan_slot(now):
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
+    init53()
     LOG.info('DB_PATH=%s persistent_mount_check=%s',DB,DB.parent == Path('/data'))
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V5.2.1 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.3 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V5.2.1 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    LOG.info('BinanceWin V5.3 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
         now = time.time()
         slot = due_scan_slot(now)
-        previous = get_state('last_scan_slot')
+        previous = get_state('v53_last_scan_slot')
         if previous != str(slot):
             # Record the slot before scanning: avoids duplicate cycles on restarts.
-            set_state('last_scan_slot', slot)
+            set_state('v53_last_scan_slot', slot)
             try:
                 last_stats = scan_once()
                 last_error = None if last_stats['successful'] > 0 else '\u672c\u8f2a\u6c92\u6709\u6210\u529f\u53d6\u5f97\u884c\u60c5'
-                set_state('last_stats', json.dumps(last_stats, ensure_ascii=False))
+                set_state('v53_last_stats', json.dumps(last_stats, ensure_ascii=False))
             except Exception as exc:
                 last_error = str(exc)[:200]
                 LOG.exception('Scan cycle failed')
         else:
-            saved = get_state('last_stats')
+            saved = get_state('v53_last_stats')
             if saved:
                 try:
                     last_stats = json.loads(saved)

@@ -17,33 +17,24 @@ def load(path):
     return df.reset_index(drop=True)
 
 def run(folder,symbol):
+    import worker as w
+    from strategy53 import assess,simulate
     frames={k:load(Path(folder)/f'{symbol}_{k}.csv') for k in ('5m','15m','1h','4h')}
-    base=frames['15m']; trades=[]; blocked_until=-1
-    for i in range(100,len(base)-1):
-        bar=base.iloc[i];t=int(bar.close_ms)
-        if t<=blocked_until:continue
-        slices={k:df[df.close_ms<=t].tail(220 if k=='15m' else 110) for k,df in frames.items()}
-        if any(len(df)<40 for df in slices.values()):continue
-        result=evaluate(slices['15m'],slices['1h'],slices['4h'],slices['5m'],historical=True)
-        if not result or result['grade']!='強訊號':continue
-        nextbar=base.iloc[i+1];entry=float(nextbar.open)
-        sign=1 if result['direction']=='偏多' else -1
-        distance=abs(result['price']-result['stop'])
-        stop=entry-sign*distance;target=entry+sign*distance*2
-        if stop<=0:continue
-        outcome='24H'; exit_price=None;exit_time=None
-        future=base.iloc[i+1:]
-        for candle in future.itertuples():
-            if int(candle.close_ms)>t+24*3600000:break
-            sl=candle.low<=stop if sign==1 else candle.high>=stop
-            tp=candle.high>=target if sign==1 else candle.low<=target
-            if sl:outcome='SL';exit_price=stop;exit_time=int(candle.close_ms);break
-            if tp:outcome='TP';exit_price=target;exit_time=int(candle.close_ms);break
-            exit_price=float(candle.close);exit_time=int(candle.close_ms)
-        if exit_price is None:continue
-        net=100*sign*(exit_price/entry-1)-(FEE_BPS+SLIPPAGE_BPS)/100
-        trades.append(dict(symbol=symbol,signal_ms=t,exit_ms=exit_time,direction=result['direction'],score=result['score'],entry=entry,stop=stop,target=target,outcome=outcome,net_pct=round(net,5)))
-        blocked_until=exit_time
+    context=pd.read_csv(Path(folder)/f'{symbol}_context.csv').sort_values('close_ms')
+    base=frames['15m']; trades=[]; blocked={}
+    for i in range(100,len(base)-96):
+        t=int(base.iloc[i].close_ms); ctx=context[context.close_ms==t]
+        if ctx.empty:continue
+        x=ctx.iloc[-1]; slices={k:df[df.close_ms<=t].tail(220) for k,df in frames.items()}
+        if min(map(len,slices.values()))<40:continue
+        for r in assess(w,slices['15m'],slices['1h'],slices['4h'],slices['5m'],x.btc_direction,x.oi_change,x.funding_rate,symbol.split('-')[0] in w.EQUITY_SYMBOLS):
+            for ex in ('fixed','breakeven','trailing'):
+                if r['grade']!='強訊號' and ex!='fixed':continue
+                key=(r['mode'],ex,r['grade'])
+                if t<=blocked.get(key,-1):continue
+                result=simulate(r,base.iloc[i+1:i+97],FEE_BPS+SLIPPAGE_BPS,ex)
+                if not result or result.get('net_pct') is None:continue
+                blocked[key]=result['exit_ms'];trades.append(dict(symbol=symbol,signal_ms=t,direction=r['direction'],score=r['score'],mode=r['mode'],exit_mode=ex,grade=r['grade'],**result))
     return trades
 
 def metrics(trades):
@@ -61,5 +52,5 @@ if __name__=='__main__':
     ap=argparse.ArgumentParser();ap.add_argument('--folder',required=True);ap.add_argument('--symbol',required=True);ap.add_argument('--out',default='backtest_results.csv');a=ap.parse_args()
     rows=run(a.folder,a.symbol)
     with open(a.out,'w',newline='',encoding='utf-8-sig') as f:
-        w=csv.DictWriter(f,fieldnames=['symbol','signal_ms','exit_ms','direction','score','entry','stop','target','outcome','net_pct']);w.writeheader();w.writerows(rows)
+        w=csv.DictWriter(f,fieldnames=['symbol','signal_ms','exit_ms','direction','score','entry','outcome','net_pct','mode','exit_mode','grade','r','funding_cost']);w.writeheader();w.writerows(rows)
     print(metrics(rows));print('Saved:',a.out)

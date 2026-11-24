@@ -1,37 +1,6 @@
-# 合約雷達 V4.0｜iPhone + Telegram 自動提醒
+# BinanceWin V5.3 研究版
+上傳本 ZIP 解壓後的檔案至原 GitHub main，Railway Start Command 保持 `python worker.py`，ONCE=0，原 Telegram 變數保留。不要上傳 token。先備份現有 SQLite；若已有 Volume，沿用原 DB_PATH。若沒有，先在原服務新增 Volume 掛載 /data，將原資料庫備份移入後才設定 DB_PATH=/data/scanner.sqlite3；無法取回舊檔時不可宣稱已遷移。BACKUP_DIR=/data/backups。備份同磁碟並非異地備份。原表保留，新表 v53、oi53 分開。每日台灣21時報告。
 
-## 功能
-- 保留 V3 手機版 Streamlit 選幣、KDJ/RSI/MACD、回測與 CSV。
-- 新增獨立 `worker.py`，每 15 分鐘 K 線收盤約 20 秒後自動掃描。
-- 符合放量、突破、MACD、RSI、KDJ 條件時傳送 Telegram 訊息。
-- 使用 SQLite 對「標的 + 方向 + K 線收盤時間」去重；同一根 K 線不重複提醒。
-- 無交易 API Key、不下單、不保證獲利。
+嚴格型才通知，最多三名，120分鐘冷卻。平衡、嚴格、回踩三套研究，強訊號另比較固定、保本、移動停損。ADX 25、OI 一小時增量非負、方向資金費率上限0.05%、BTC 1H/4H MACD同向為初始假設。OI 需約一小時暖機；缺值不視為通過嚴格型。美股九個代號只做交易所匹配，人工核對交易所合約規格及底層後，才將精確 ID 加入 VERIFIED_EQUITY_CONTRACTS（逗號分隔）。不要盲目核准。EVENT_BLACKOUT_UTC 沿用原版手動事件設定。
 
-## 安裝（需可長時間運行的電腦或雲端主機）
-```bash
-python -m pip install -r requirements.txt
-streamlit run app.py
-```
-另開終端機，設定環境變數後執行 `python worker.py`，背景掃描才會開始。
-`streamlit run app.py` 本身**不會**啟動背景提醒。
-
-### Telegram 設定
-1. Telegram 搜尋官方 `@BotFather`，建立 bot，取得 token。
-2. 在 Telegram 傳訊息給自己的 bot（按 Start）。
-3. 透過 `https://api.telegram.org/bot<你的token>/getUpdates` 查詢訊息中的 `chat.id`。
-4. 將 `TELEGRAM_BOT_TOKEN` 與 `TELEGRAM_CHAT_ID` 設成**伺服器環境變數**。不要把 token 寫入程式碼或上傳 GitHub。
-5. 測試單次掃描：`ONCE=1 python worker.py`（Windows PowerShell 可用 `$env:ONCE="1"; python worker.py`）。
-6. 正式運作：`python worker.py`，並使用主機服務管理器保持常駐。
-
-`.env.example` 僅供參考；程式不會自動讀取 `.env`，必須自行設定環境變數。
-
-## iPhone
-將 Streamlit 網站部署到可存取的 HTTPS 網址，再使用 Safari → 分享 → 加入主畫面。**僅有程式檔不等於網站已上線。**
-
-## 注意
-- 15 分鐘排程不等於零延遲；網路延遲、API 限速與停機都會影響提醒。
-- worker 重啟後依當前最新已收盤 K 線繼續；不補發停機期間所有歷史訊號。
-- Telegram API 傳送成功但 SQLite 寫入失敗時，極少數情況仍可能重複提醒。
-- 資料庫應放在持久磁碟；多個 worker 同時運作可能造成重複推播，請只啟動一個。
-- Streamlit Cloud 不保證常駐背景 worker；需另行部署可長期運作的服務。
-- 回測不包含歷史資金費、爆倉與真實撮合，並不代表可實現的交易績效。
+回測：python backtest.py --folder data --symbol BTC-USDT-SWAP --out results.csv。沿用四個 OHLCV CSV，新增 BTC-USDT-SWAP_context.csv 欄位 close_ms,btc_direction,oi_change,funding_rate，必須是當時可得資料，BTC方向為 -1/0/1，OI及費率為小數。回測及即時共用 simulate：下一根開盤且在區間內才成交，缺K線不計績效，同根停損優先，跳空停損按開盤，保本/移動停損次根生效，24小時到期。固定2R，費用預設16bps。尚未接入實際歷史資金費結算，因此報酬未含資金費；不是完整淨報酬。分組績效非整體資金曲線。無真實行情樣本回測、無實際API連線驗證；BingX衍生數據格式需部署確認。交易所切換期間舊來源未結算需待來源恢復。此版本為研究測試版，非實盤獲利保證。
