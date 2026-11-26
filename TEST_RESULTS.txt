@@ -1,14 +1,5 @@
-test_backtest_metrics (test_v52.StrictTests.test_backtest_metrics) ... ok
-test_event_windows (test_v52.StrictTests.test_event_windows) ... ok
-test_no_risk_budget_in_message_source (test_v52.StrictTests.test_no_risk_budget_in_message_source) ... ok
-test_strict_breakout (test_v52.StrictTests.test_strict_breakout) ... ok
-test_adx (test_v53.Test.test_adx) ... ok
-test_breakeven_next_bar (test_v53.Test.test_breakeven_next_bar) ... ok
-test_gap (test_v53.Test.test_gap) ... ok
-test_no_chase (test_v53.Test.test_no_chase) ... ok
-test_stop_first (test_v53.Test.test_stop_first) ... ok
-
+..............
 ----------------------------------------------------------------------
-Ran 9 tests in 0.011s
+Ran 14 tests in 0.031s
 
 OK

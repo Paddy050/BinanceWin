@@ -1,4 +1,4 @@
-"""BinanceWin V5.3 - public futures market research alerts; never places orders."""
+"""BinanceWin V5.4 - public futures market research alerts; never places orders."""
 import os
 import time
 import json
@@ -16,7 +16,7 @@ import pandas as pd
 
 LOG = logging.getLogger('binancewin')
 HTTP = requests.Session()
-HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.2.1'})
+HTTP.headers.update({'User-Agent': 'BinanceWinResearch/5.4'})
 DB = Path(os.getenv('DB_PATH', str(Path(__file__).with_name('scanner.sqlite3'))))
 TIMEOUT = float(os.getenv('HTTP_TIMEOUT', '12'))
 TOP_N = max(1, min(100, int(os.getenv('TOP_N', '30'))))
@@ -209,10 +209,10 @@ def bingx_universe():
     return [s for _, s in ranked[:TOP_N]]
 
 def candles(venue, symbol, interval, limit=220):
-    duration = {'5m':300000, '15m':900000, '1h':3600000, '4h':14400000}[interval]
+    duration = {'1m':60000,'5m':300000, '15m':900000, '1h':3600000, '4h':14400000}[interval]
     rows = []
     if venue == 'OKX':
-        data = okx_get('/api/v5/market/history-candles', {'instId': symbol, 'bar': {'5m':'5m','15m':'15m','1h':'1H','4h':'4H'}[interval], 'limit': min(limit, 300)})
+        data = okx_get('/api/v5/market/history-candles', {'instId': symbol, 'bar': {'1m':'1m','5m':'5m','15m':'15m','1h':'1H','4h':'4H'}[interval], 'limit': min(limit, 300)})
         for x in data:
             if len(x) < 9 or str(x[8]) != '1':
                 continue
@@ -448,7 +448,7 @@ def notify(venue,symbol,row):
         else: confirmation='未通過'
         missing=', '.join(k for k,v in checks.items() if not v)
         tp1=row['price']+(row['target']-row['price'])*(1.5/RISK_REWARD)
-        message=(f'🔔 BinanceWin V5.3｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
+        message=(f'🔔 BinanceWin V5.4｜{reason}｜{row["direction"]} {row["grade"]} {row["score"]}/100\n'
                  f'{venue}｜{symbol}｜{tw_time(row["candle"])}\n'
                  f'進場參考 {fmt_price(row["price"])}｜SL {fmt_price(row["stop"])}\n'
                  f'TP1 {fmt_price(tp1)}｜TP2 {fmt_price(row["target"])}\n'
@@ -554,7 +554,7 @@ def settle53(venue,symbol,d):
             if result:c.execute('UPDATE v53 SET outcome=?,net=?,r=?,exit_ms=? WHERE venue=? AND symbol=? AND mode=? AND exit_mode=? AND t=?',(result['outcome'],result.get('net_pct'),result.get('r'),result.get('exit_ms'),venue,symbol,mode,ex,t))
 
 def scan_once():
-    init53(); notes=[];venue=None
+    init53(); init_tracking(); notes=[];venue=None
     for name,probe in [('OKX',okx_universe),('BingX',bingx_universe)]:
         try:
             symbols=probe();candles(name,symbols[0],'15m',60);venue=name;break
@@ -570,6 +570,7 @@ def scan_once():
         bs='BTC-USDT-SWAP' if venue=='OKX' else 'BTC-USDT'; bh=candles(venue,bs,'1h',110);bf=candles(venue,bs,'4h',110); a=float(macd_hist(bh.close).iloc[-1]);b=float(macd_hist(bf.close).iloc[-1]);btc=1 if a>0 and b>0 else -1 if a<0 and b<0 else 0
     except Exception:notes.append('BTC方向缺失')
     with sqlite3.connect(DB) as c:pending=[x[0] for x in c.execute('SELECT DISTINCT symbol FROM v53 WHERE venue=? AND outcome IS NULL',(venue,))]
+    stats['regime']='多頭' if btc==1 else '空頭' if btc==-1 else '震盪' if btc==0 else '未知'
     ranked=[]; universe=list(dict.fromkeys(symbols+extras))
     for symbol in list(dict.fromkeys(universe+pending)):
         stats['attempted']+=1
@@ -595,8 +596,9 @@ def scan_once():
         try:
             key='v53_alert_'+venue+symbol+r['direction']; last=get_state(key)
             if last and time.time()-float(last)<ALERT_COOLDOWN_MIN*60:continue
-            if not r['lo']<=live_price(venue,symbol)<=r['hi']:continue
-            telegram(f"🎯 BinanceWin V5.3｜{symbol} {r['direction']} {r['score']}分\n進場 {r['lo']:.6g}～{r['hi']:.6g}｜SL {r['stop']:.6g}｜TP {r['target']:.6g}\nADX {r['adx']:.1f}｜放量 {r['volume']:.2f}×｜OI {r['oi']:+.1%}｜費率 {r['funding']:.4%}\n確認狀態：全部通過｜回踩 {'是' if r['retest'] else '否'}\n僅供研究，不自動下單")
+            if in_event_blackout(datetime.now(timezone.utc)):continue
+            if not queue_tracking(venue,symbol,r):continue
+            telegram(f"🎯 BinanceWin V5.4｜{symbol} {r['direction']} {r['score']}分\n進場 {r['lo']:.6g}～{r['hi']:.6g}｜SL {r['stop']:.6g}｜TP {r['target']:.6g}\nADX {r['adx']:.1f}｜放量 {r['volume']:.2f}×｜OI {r['oi']:+.1%}｜費率 {r['funding']:.4%}\n狀態：等待進場｜回踩 {'是' if r['retest'] else '否'}\n僅供研究，不自動下單")
             set_state(key,time.time());stats['sent']+=1
         except Exception:LOG.warning('alert failed %s',symbol)
     LOG.info('Scan complete: %s',json.dumps(stats,ensure_ascii=False));return stats
@@ -604,14 +606,13 @@ def scan_once():
 def status_message(stats,last_error=None):
     now=datetime.now(TZ).strftime('%Y/%m/%d %H:%M 台灣時間')
     rate=100*stats['successful']/stats['attempted'] if stats['attempted'] else 0
-    return (f'📡 BinanceWin V5.3 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
+    return (f'📡 BinanceWin V5.4 每小時狀態\n時間：{now}\n行情來源：{stats["venue"]}\n'
             f'去重後掃描：{stats["successful"]}/{stats["attempted"]}（{rate:.0f}%）\n'
             f'加密熱門名單：{stats.get("crypto_listed", 0)}｜指定代號匹配：{stats.get("equity_matched", 0)}/{len(EQUITY_SYMBOLS)}\n'
             f'未匹配：{", ".join(stats.get("equity_missing", [])) or "無"}\n'
-            f'已人工核准合約：{stats.get("equity_verified",0)}｜未驗證：{", ".join(stats.get("equity_unverified", [])) or "無"}\n'
             f'強訊號：{stats["candidates"]}｜候選/觀察：{stats["watch"]}｜已發通知：{stats["sent"]}\n'
             f'單幣錯誤：{stats["errors"]}｜異常：{last_error or "; ".join(stats["notes"]) or "無"}\n'
-            f'舊版歷史模擬（假設成交）：{v5_summary()}\n僅供研究，不自動下單。')
+            f'追蹤中：{tracking_count()}｜市場：{stats.get("regime","未知")}\n僅供研究，不自動下單。')
 
 def backup_database():
     """Consistent SQLite backup on same persistent mount. Local backup is not off-site."""
@@ -641,14 +642,14 @@ def legacy_daily_report():
         avg=sum(p for _,p in closed)/len(closed)
         result=f'{len(closed)} 筆｜淨正報酬比例 {win:.1%}｜平均 {avg:+.2f}%'
     else: result='尚無已結算訊號'
-    return (f'📊 BinanceWin V5.3 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
+    return (f'📊 BinanceWin V5.4 每日模擬報告｜{datetime.now(TZ):%Y/%m/%d}\n'
             f'近24小時：強訊號 {counts.get("強訊號",0)}｜候選 {counts.get("候選訊號",0)}｜觀察 {counts.get("觀察訊號",0)}\n'
             f'近24小時結算：{result}\n未結算：{pending} 筆\n'
             f'歷史強訊號：{v5_summary()}\n模擬不等於實盤，無自動下單。')
 
 def daily_report():
     from backtest import metrics
-    lines=['📊 BinanceWin V5.3 每日研究報告（累計；未含資金費實際結算）']
+    lines=['📊 BinanceWin V5.4 每日研究報告（累計；未含資金費實際結算）']
     with sqlite3.connect(DB) as c:
         groups=c.execute('SELECT DISTINCT mode,exit_mode,grade FROM v53').fetchall()
         ranking=[]
@@ -657,9 +658,10 @@ def daily_report():
             if not rows:continue
             m=metrics([{'net_pct':x[0]} for x in rows]);pf=m['profit_factor'];avg_r=sum(x[1] for x in rows)/len(rows)
             line=f"{mode}/{ex}/{grade} {len(rows)}筆｜正報酬 {m['positive_net_rate']:.0%}｜平均R {avg_r:+.2f}｜PF {pf:.2f}" if pf is not None else f"{mode}/{ex}/{grade} {len(rows)}筆｜平均R {avg_r:+.2f}｜PF 無虧損"
-            ranking.append((avg_r,line))
-        lines.extend(x[1] for x in sorted(ranking,reverse=True));lines.append('未結算 '+str(c.execute('SELECT COUNT(*) FROM v53 WHERE outcome IS NULL').fetchone()[0]))
-    return '\n'.join(lines+['排名僅供研究；非實盤績效。'])[:3900]
+            line=line.replace('balanced','平衡').replace('strict','嚴格').replace('retest','回踩').replace('fixed','固定').replace('breakeven','保本').replace('trailing','移動')
+            ranking.append((len(rows)>=30,avg_r,line+('｜樣本不足' if len(rows)<30 else '')))
+        lines.extend(x[2] for x in sorted(ranking,reverse=True)[:3]);lines.append('未結算 '+str(c.execute('SELECT COUNT(*) FROM v53 WHERE outcome IS NULL').fetchone()[0]))
+    return '\n'.join(lines+[tracking_summary(),'排名僅供研究；非實盤績效。'])[:3900]
 
 def due_scan_slot(now):
     """Most recent 15-minute boundary + offset, expressed as integer slot."""
@@ -669,24 +671,25 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     init_db()
     init53()
+    init_tracking()
     LOG.info('DB_PATH=%s persistent_mount_check=%s',DB,DB.parent == Path('/data'))
     if os.getenv('TEST_TELEGRAM', '0') == '1':
-        telegram('\u2705 BinanceWin V5.3 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
+        telegram('\u2705 BinanceWin V5.4 Telegram \u6e2c\u8a66\u6210\u529f\uff1b\u4e0d\u4ee3\u8868\u884c\u60c5\u6383\u63cf\u6210\u529f\u3002')
         return
     if os.getenv('ONCE', '0') == '1':
         stats = scan_once()
         telegram(status_message(stats))
         return
-    LOG.info('BinanceWin V5.3 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
+    LOG.info('BinanceWin V5.4 started; OKX primary, BingX fallback, TOP_N=%s, equity_watch=%s', TOP_N, ','.join(EQUITY_SYMBOLS))
     last_stats = {'venue': 'WAITING', 'attempted': 0, 'successful': 0, 'candidates': 0, 'watch': 0, 'crypto_listed': 0, 'equity_matched': 0, 'equity_missing': EQUITY_SYMBOLS[:], 'equity_unverified': [], 'sent': 0, 'errors': 0, 'notes': []}
     last_error = None
     while True:
         now = time.time()
         slot = due_scan_slot(now)
-        previous = get_state('v53_last_scan_slot')
+        previous = get_state('v54_last_scan_slot')
         if previous != str(slot):
             # Record the slot before scanning: avoids duplicate cycles on restarts.
-            set_state('v53_last_scan_slot', slot)
+            set_state('v54_last_scan_slot', slot)
             try:
                 last_stats = scan_once()
                 last_error = None if last_stats['successful'] > 0 else '\u672c\u8f2a\u6c92\u6709\u6210\u529f\u53d6\u5f97\u884c\u60c5'
@@ -701,6 +704,10 @@ def main():
                     last_stats = json.loads(saved)
                 except ValueError:
                     pass
+        if int(now//60)!=getattr(main,'track_slot',None):
+            main.track_slot=int(now//60)
+            try: track_active()
+            except Exception: LOG.exception('Tracking failed')
         # Backup once per local day; do not report success until SQLite backup finishes.
         today=datetime.now(TZ).strftime('%Y-%m-%d')
         if get_state('last_backup_day')!=today:
@@ -726,6 +733,8 @@ def main():
         # Avoid sleeping across a scan boundary. Cap sleep for failed Telegram retries.
         next_boundary = (int((time.time() - SCAN_OFFSET) // 900) + 1) * 900 + SCAN_OFFSET
         time.sleep(max(1, min(30, next_boundary - time.time())))
+
+from tracking54 import init_tracking, queue_tracking, track_active, tracking_count, tracking_summary
 
 if __name__ == '__main__':
     main()
